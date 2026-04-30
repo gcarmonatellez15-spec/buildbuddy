@@ -6,6 +6,8 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -46,6 +48,10 @@ import (
 
 const (
 	defaultChunkTransferConcurrency = 32
+
+	// Keep requests well under common 2-4MiB gRPC message limits. A serialized
+	// SHA256 chunk digest is ~73 bytes, and larger digest functions need more.
+	streamedSpliceMaxDigestsPerRequest = 10_000
 )
 
 var (
@@ -1265,7 +1271,14 @@ func (s *ByteStreamServerProxy) writeChunked(ctx context.Context, stream bspb.By
 	// Tag outgoing chunk uploads so intermediaries downstream of this proxy
 	// do not re-chunk them.
 	chunkUploadCtx := cdc.ContextWithChunked(ctx)
-	uploader, err := newChunkUploader(chunkUploadCtx, s, instanceName, digestFunction)
+	var splicer *streamedSplicer
+	if s.shouldStreamSpliceBlob(ctx, rn) {
+		splicer, err = newStreamedSplicer(chunkUploadCtx, s.remoteCAS, rn, digestFunction)
+		if err != nil {
+			return writeChunkedResult{}, status.WrapErrorf(err, "start streamed splice")
+		}
+	}
+	uploader, err := newChunkUploader(chunkUploadCtx, s, instanceName, digestFunction, splicer)
 	if err != nil {
 		return writeChunkedResult{}, err
 	}
@@ -1311,8 +1324,7 @@ func (s *ByteStreamServerProxy) writeChunked(ctx context.Context, stream bspb.By
 			}
 			localWriteSpn.End()
 		}
-		uploader.addChunk(compressedData, poolBuf, chunkDigest)
-		return nil
+		return uploader.addChunk(compressedData, poolBuf, chunkDigest)
 	}
 
 	chunker, err := chunking.NewChunker(ctx, int(chunking.AvgChunkSizeBytes(ctx, s.efp)), chunkWriteFn)
@@ -1412,24 +1424,251 @@ func (s *ByteStreamServerProxy) writeChunked(ctx context.Context, stream bspb.By
 
 	remoteStart := time.Now()
 
-	_, flushSpn := tracing.StartNamedSpan(ctx, "flushChunkUploads")
-	if err := uploader.flush(); err != nil {
+	_, flushSpn := tracing.StartNamedSpan(ctx, "flushChunkedWrite")
+	if err := uploader.flush(ctx, manifest); err != nil {
 		flushSpn.End()
-		return writeChunkedResult{}, status.WrapErrorf(err, "uploading missing chunks to remote")
+		return writeChunkedResult{}, err
 	}
 	flushSpn.End()
 	result.chunksDeduped = int(uploader.dedupedChunks.Load())
 	result.chunkBytesDeduped = uploader.dedupedChunkBytes.Load()
 
-	spliceCtx, spliceSpn := tracing.StartNamedSpan(ctx, "remote.SpliceBlob")
-	_, err = s.remoteCAS.SpliceBlob(spliceCtx, manifest.ToSpliceBlobRequest())
-	spliceSpn.End()
-	if err != nil {
-		return writeChunkedResult{}, status.WrapErrorf(err, "splice blob on remote")
-	}
-
 	result.remoteDuration = time.Since(remoteStart)
 	return result, stream.SendAndClose(&bspb.WriteResponse{CommittedSize: bytesReceived})
+}
+
+func (s *ByteStreamServerProxy) shouldStreamSpliceBlob(ctx context.Context, rn *digest.CASResourceName) bool {
+	if s.remoteCAS == nil || s.efp == nil {
+		return false
+	}
+	threshold := s.efp.Int64(ctx, "cache_proxy.splice_stream_threshold_bytes", math.MaxInt64)
+	return rn.GetDigest().GetSizeBytes() >= threshold
+}
+
+// isStreamedSpliceFallbackError reports whether a streamed-splice error means
+// the remote cannot serve SpliceChunks (not deployed yet, or unreachable), in
+// which case the splicer abandons streaming and the uploader falls back to
+// unary SpliceBlob. Any other error is fatal for the write.
+func isStreamedSpliceFallbackError(err error) bool {
+	return status.IsUnimplementedError(err) || status.IsUnavailableError(err)
+}
+
+// streamedSplicer owns a SpliceChunks client stream. Callers report chunk
+// digests in blob order (addChunk) and, separately, which chunks are known to
+// exist remotely (markRemoteAvailable); a dedicated run() goroutine performs
+// all stream I/O. Fallback-eligible errors (see isStreamedSpliceFallbackError)
+// are absorbed: addChunk/markRemoteAvailable keep returning nil and commit
+// reports spliced=false so the caller can fall back to unary SpliceBlob.
+type streamedSplicer struct {
+	stream         repb.ContentAddressableStorage_SpliceChunksClient
+	instanceName   string
+	blobDigest     *repb.Digest
+	digestFunction repb.DigestFunction_Value
+	metadataSent   bool
+
+	// events carries chunk/availability/commit events to the run() goroutine.
+	// eventSlots is a semaphore mirroring the events buffer: enqueue reserves
+	// a slot before locking mu so the buffered send under mu can never block,
+	// and run() returns the slot when it consumes an event. done is closed by
+	// run() after recording err, so enqueue deterministically returns the
+	// terminal error once the splicer has finished or failed.
+	events     chan streamedSpliceEvent
+	eventSlots chan struct{}
+	done       chan struct{}
+
+	mu         sync.Mutex
+	doneClosed bool
+	err        error
+}
+
+type streamedSpliceEvent struct {
+	chunk     *repb.Digest
+	available []*repb.Digest
+	commit    bool
+}
+
+// newStreamedSplicer returns (nil, nil) when the remote cannot serve
+// SpliceChunks; callers should treat a nil splicer as "use unary SpliceBlob".
+func newStreamedSplicer(ctx context.Context, client repb.ContentAddressableStorageClient, rn *digest.CASResourceName, digestFunction repb.DigestFunction_Value) (*streamedSplicer, error) {
+	stream, err := client.SpliceChunks(ctx)
+	if err != nil {
+		if isStreamedSpliceFallbackError(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	s := &streamedSplicer{
+		stream:         stream,
+		instanceName:   rn.GetInstanceName(),
+		blobDigest:     rn.GetDigest(),
+		digestFunction: digestFunction,
+		events:         make(chan streamedSpliceEvent, defaultChunkTransferConcurrency),
+		eventSlots:     make(chan struct{}, defaultChunkTransferConcurrency),
+		done:           make(chan struct{}),
+	}
+	for i := 0; i < cap(s.eventSlots); i++ {
+		s.eventSlots <- struct{}{}
+	}
+	go s.run(ctx)
+	return s, nil
+}
+
+// addChunk records the digest of the next chunk in blob order. It must be
+// called for every chunk, including repeats of an already-added digest.
+func (s *streamedSplicer) addChunk(d *repb.Digest) error {
+	return s.enqueue(streamedSpliceEvent{chunk: d})
+}
+
+// markRemoteAvailable records that the given chunks are known to exist
+// remotely, in any order relative to addChunk.
+func (s *streamedSplicer) markRemoteAvailable(digests []*repb.Digest) error {
+	if len(digests) == 0 {
+		return nil
+	}
+	return s.enqueue(streamedSpliceEvent{available: slices.Clone(digests)})
+}
+
+// commit asks the sender goroutine to finish the streamed splice, then waits
+// until the server has accepted or rejected it. It returns spliced=false with
+// a nil error when streaming was abandoned because the remote cannot serve
+// SpliceChunks; the caller should fall back to unary SpliceBlob.
+func (s *streamedSplicer) commit(ctx context.Context) (spliced bool, err error) {
+	_, spn := tracing.StartNamedSpan(ctx, "remote.SpliceChunks")
+	defer spn.End()
+
+	if err := s.enqueue(streamedSpliceEvent{commit: true}); err != nil {
+		return false, err
+	}
+	<-s.done
+	terminalErr := s.getErr()
+	if terminalErr == nil {
+		return true, nil
+	}
+	if isStreamedSpliceFallbackError(terminalErr) {
+		return false, nil
+	}
+	return false, terminalErr
+}
+
+func (s *streamedSplicer) enqueue(event streamedSpliceEvent) error {
+	// Reserve buffer space first so sending while holding mu cannot block.
+	select {
+	case <-s.done:
+		return fatalOnly(s.getErr())
+	case <-s.eventSlots:
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.doneClosed {
+		return fatalOnly(s.err)
+	}
+	s.events <- event
+	return nil
+}
+
+// fatalOnly hides fallback-eligible errors from addChunk/markRemoteAvailable
+// callers: the abandoned splice surfaces at commit as spliced=false instead.
+func fatalOnly(err error) error {
+	if isStreamedSpliceFallbackError(err) {
+		return nil
+	}
+	return err
+}
+
+func (s *streamedSplicer) getErr() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.err
+}
+
+func (s *streamedSplicer) run(ctx context.Context) {
+	// The uploader reports chunks when they are discovered and separately marks
+	// them available after FindMissingBlobs or BatchUpdateBlobs confirms they
+	// exist remotely. Availability can arrive out of order, so keep the original
+	// chunk order and stream only the contiguous prefix known to be present.
+	var digests []*repb.Digest
+	available := make(map[digest.Key]bool)
+	nextSendIndex := 0
+	committing := false
+
+	for {
+		for {
+			start := nextSendIndex
+			for nextSendIndex < len(digests) &&
+				nextSendIndex-start < streamedSpliceMaxDigestsPerRequest &&
+				available[digest.NewKey(digests[nextSendIndex])] {
+				nextSendIndex++
+			}
+			if start == nextSendIndex {
+				break
+			}
+			if err := s.send(&repb.SpliceChunksRequest{ChunkDigests: digests[start:nextSendIndex]}); err != nil {
+				s.closeWithErr(err)
+				return
+			}
+		}
+		if committing {
+			if nextSendIndex != len(digests) {
+				s.closeWithErr(status.InternalErrorf("streamed splice has sent %d of %d chunks", nextSendIndex, len(digests)))
+				return
+			}
+			// Closing the request stream commits the splice.
+			_, err := s.stream.CloseAndRecv()
+			s.closeWithErr(err)
+			return
+		}
+
+		select {
+		case event := <-s.events:
+			s.eventSlots <- struct{}{}
+			if event.chunk != nil {
+				digests = append(digests, event.chunk)
+			}
+			for _, d := range event.available {
+				available[digest.NewKey(d)] = true
+			}
+			if event.commit {
+				committing = true
+			}
+		case <-ctx.Done():
+			s.closeWithErr(ctx.Err())
+			return
+		}
+	}
+}
+
+func (s *streamedSplicer) send(req *repb.SpliceChunksRequest) error {
+	sendReq := req
+	if !s.metadataSent {
+		sendReq = &repb.SpliceChunksRequest{
+			InstanceName:     s.instanceName,
+			BlobDigest:       s.blobDigest,
+			ChunkDigests:     req.GetChunkDigests(),
+			DigestFunction:   s.digestFunction,
+			ChunkingFunction: repb.ChunkingFunction_FAST_CDC_2020,
+		}
+		s.metadataSent = true
+	}
+	if err := s.stream.Send(sendReq); err != nil {
+		if err == io.EOF {
+			_, err = s.stream.CloseAndRecv()
+		}
+		return err
+	}
+	return nil
+}
+
+func (s *streamedSplicer) closeWithErr(err error) {
+	s.mu.Lock()
+	if s.doneClosed {
+		s.mu.Unlock()
+		return
+	}
+	s.doneClosed = true
+	s.err = err
+	s.mu.Unlock()
+	close(s.done)
 }
 
 type pendingChunk struct {
@@ -1457,10 +1696,12 @@ type chunkUploader struct {
 	pendingBatchUploadSize int64
 	dedupedChunks          atomic.Int64
 	dedupedChunkBytes      atomic.Int64
+	splicer                *streamedSplicer
 }
 
-// newChunkUploader batches chunks into FMB groups and upload requests of up to 2 MiB.
-func newChunkUploader(ctx context.Context, s *ByteStreamServerProxy, instanceName string, digestFunction repb.DigestFunction_Value) (*chunkUploader, error) {
+// newChunkUploader batches chunks into FMB groups and upload requests of up to
+// 2 MiB. splicer may be nil, in which case flush splices with unary SpliceBlob.
+func newChunkUploader(ctx context.Context, s *ByteStreamServerProxy, instanceName string, digestFunction repb.DigestFunction_Value, splicer *streamedSplicer) (*chunkUploader, error) {
 	concurrency := defaultChunkTransferConcurrency
 	if s.efp != nil {
 		concurrency = int(s.efp.Int64(ctx, "cache_proxy.chunk_upload_concurrency", defaultChunkTransferConcurrency))
@@ -1482,16 +1723,23 @@ func newChunkUploader(ctx context.Context, s *ByteStreamServerProxy, instanceNam
 		batchG:         batchG,
 		batchCtx:       batchCtx,
 		seen:           make(map[digest.Key]int),
+		splicer:        splicer,
 	}, nil
 }
 
 // addChunk transfers ownership of poolBuf to the uploader. The uploader returns
 // it to the pool once the chunk is deduped or its upload completes.
-func (c *chunkUploader) addChunk(compressedData []byte, poolBuf []byte, d *repb.Digest) {
+func (c *chunkUploader) addChunk(compressedData []byte, poolBuf []byte, d *repb.Digest) error {
 	chunk := pendingChunk{
 		digest:         d,
 		compressedData: compressedData,
 		poolBuf:        poolBuf,
+	}
+	if c.splicer != nil {
+		if err := c.splicer.addChunk(d); err != nil {
+			c.s.bufPool.Put(chunk.poolBuf)
+			return status.WrapErrorf(err, "send chunk to streamed splice")
+		}
 	}
 	dk := digest.NewKey(d)
 
@@ -1501,16 +1749,24 @@ func (c *chunkUploader) addChunk(compressedData []byte, poolBuf []byte, d *repb.
 	c.mu.Unlock()
 	if seenCount > 1 {
 		c.s.bufPool.Put(chunk.poolBuf)
-		return
+		return nil
 	}
 
 	c.pendingFMB = append(c.pendingFMB, chunk)
 	if len(c.pendingFMB) >= c.concurrency {
 		c.flushPendingFMB()
 	}
+	return nil
 }
 
-func (c *chunkUploader) flush() error {
+func (c *chunkUploader) flush(ctx context.Context, manifest *chunking.Manifest) error {
+	if err := c.flushUploads(); err != nil {
+		return status.WrapErrorf(err, "uploading missing chunks to remote")
+	}
+	return c.splice(ctx, manifest)
+}
+
+func (c *chunkUploader) flushUploads() error {
 	c.flushPendingFMB()
 	fmbErr := c.fmbG.Wait()
 	if fmbErr == nil {
@@ -1529,6 +1785,25 @@ func (c *chunkUploader) flush() error {
 		return fmbErr
 	}
 	return batchErr
+}
+
+func (c *chunkUploader) splice(ctx context.Context, manifest *chunking.Manifest) error {
+	if c.splicer != nil {
+		spliced, err := c.splicer.commit(ctx)
+		if err != nil {
+			return status.WrapErrorf(err, "streamed splice chunks on remote")
+		}
+		if spliced {
+			return nil
+		}
+	}
+	spliceCtx, spn := tracing.StartNamedSpan(ctx, "remote.SpliceBlob")
+	defer spn.End()
+	_, err := c.s.remoteCAS.SpliceBlob(spliceCtx, manifest.ToSpliceBlobRequest())
+	if err != nil {
+		return status.WrapErrorf(err, "splice blob on remote")
+	}
+	return nil
 }
 
 func (c *chunkUploader) flushPendingFMB() {
@@ -1566,6 +1841,7 @@ func (c *chunkUploader) processFMBGroup(group []pendingChunk) error {
 		missingSet.Add(d.GetHash())
 	}
 
+	var availableDigests []*repb.Digest
 	for _, chunk := range group {
 		if missingSet.Contains(chunk.digest.GetHash()) {
 			c.queueUploadChunk(chunk)
@@ -1573,8 +1849,9 @@ func (c *chunkUploader) processFMBGroup(group []pendingChunk) error {
 		}
 		c.recordDedupedChunk(chunk.digest)
 		c.s.bufPool.Put(chunk.poolBuf)
+		availableDigests = append(availableDigests, chunk.digest)
 	}
-	return nil
+	return c.markChunksRemoteAvailable(availableDigests)
 }
 
 func (c *chunkUploader) queueUploadChunk(chunk pendingChunk) {
@@ -1634,7 +1911,21 @@ func (c *chunkUploader) uploadBatch(batch []pendingChunk) error {
 	metrics.ByteStreamChunkedWriteUploadSizeBytes.With(prometheus.Labels{
 		metrics.StatusLabel: status.MetricsLabel(err),
 	}).Observe(float64(uploadSizeBytes))
-	return err
+	if err != nil {
+		return err
+	}
+	digests := make([]*repb.Digest, 0, len(batch))
+	for _, chunk := range batch {
+		digests = append(digests, chunk.digest)
+	}
+	return c.markChunksRemoteAvailable(digests)
+}
+
+func (c *chunkUploader) markChunksRemoteAvailable(digests []*repb.Digest) error {
+	if c.splicer == nil {
+		return nil
+	}
+	return c.splicer.markRemoteAvailable(digests)
 }
 
 func (c *chunkUploader) recordDedupedChunk(d *repb.Digest) {

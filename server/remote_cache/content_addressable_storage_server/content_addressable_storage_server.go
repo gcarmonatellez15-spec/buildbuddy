@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"flag"
 	"fmt"
+	"io"
 	"math/rand"
 	"os"
 	"slices"
@@ -34,6 +35,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/util/quota"
 	"github.com/buildbuddy-io/buildbuddy/server/util/rpcutil"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
+	"github.com/buildbuddy-io/buildbuddy/server/util/tracing"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/errgroup"
@@ -69,6 +71,10 @@ var (
 	getTreeSubtreeSupport     = flag.Bool("cache.get_tree_subtree_support", true, "If true, respect the 'send_cache_subtrees' field on GetTree")
 	getTreeSubtreeMinDirCount = flag.Int("cache.get_tree_subtree_min_dir_count", 10, "The minimum number of directory children a subtree must have before we're willing to tell the client to cache it (inclusive).")
 )
+
+// Keep responses well under common 2-4MiB gRPC message limits. A serialized
+// SHA256 chunk digest is ~73 bytes, and larger digest functions need more.
+const splitChunksMaxDigestsPerResponse = 10_000
 
 type ContentAddressableStorageServer struct {
 	env   environment.Env
@@ -1262,6 +1268,158 @@ func (s *ContentAddressableStorageServer) spliceBlob(ctx context.Context, req *r
 	}, nil
 }
 
+func (s *ContentAddressableStorageServer) SpliceChunks(stream repb.ContentAddressableStorage_SpliceChunksServer) error {
+	start := time.Now()
+	err := s.spliceChunks(stream)
+	if err != nil {
+		log.CtxInfof(stream.Context(), "SpliceChunks failed: %v", err)
+	}
+	metrics.SpliceChunksDurationUsec.With(prometheus.Labels{
+		metrics.StatusHumanReadableLabel: status.MetricsLabel(err),
+	}).Observe(float64(time.Since(start).Microseconds()))
+	return err
+}
+
+func (s *ContentAddressableStorageServer) spliceChunks(stream repb.ContentAddressableStorage_SpliceChunksServer) error {
+	ctx, spn := tracing.StartSpan(stream.Context())
+	defer spn.End()
+
+	firstReq, err := stream.Recv()
+	if err != nil {
+		if err == io.EOF {
+			return status.InvalidArgumentError("blob_digest is required")
+		}
+		return err
+	}
+
+	instanceName := firstReq.GetInstanceName()
+	blobDigest := firstReq.GetBlobDigest()
+	if blobDigest == nil {
+		return status.InvalidArgumentError("blob_digest is required")
+	}
+	digestFunction := firstReq.GetDigestFunction()
+	if digestFunction == repb.DigestFunction_UNKNOWN {
+		return status.InvalidArgumentError("digest_function is required")
+	}
+	if cf := firstReq.GetChunkingFunction(); cf != repb.ChunkingFunction_UNKNOWN && cf != repb.ChunkingFunction_FAST_CDC_2020 {
+		return status.InvalidArgumentErrorf("unsupported chunking function %v", cf)
+	}
+	blobRN := digest.NewCASResourceName(blobDigest, instanceName, digestFunction)
+	if err := blobRN.Validate(); err != nil {
+		return status.InvalidArgumentErrorf("invalid blob resource name %v: %s", blobRN, err)
+	}
+
+	ctx, err = prefix.AttachUserPrefixToContext(ctx, s.env.GetAuthenticator())
+	if err != nil {
+		return err
+	}
+	canWrite, err := capabilities.IsGranted(ctx, s.env.GetAuthenticator(), cappb.Capability_CACHE_WRITE|cappb.Capability_CAS_WRITE)
+	if err != nil {
+		return err
+	}
+	if !canWrite {
+		// Match ByteStream.Write / BatchUpdateBlobs behavior for read-only API
+		// keys: pretend the write succeeded without storing anything.
+		for {
+			_, err := stream.Recv()
+			if err == io.EOF {
+				return stream.SendAndClose(&repb.SpliceBlobResponse{BlobDigest: blobDigest})
+			}
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	if !chunking.Enabled(ctx, s.env.GetExperimentFlagProvider()) {
+		return status.UnimplementedError("SpliceChunks RPC is not currently enabled")
+	}
+
+	hasher, err := digest.HashForDigestType(digestFunction)
+	if err != nil {
+		return status.InvalidArgumentErrorf("invalid digest function: %s", err)
+	}
+
+	var chunkDigests []*repb.Digest
+	totalSize := int64(0)
+	consumeChunks := func(req *repb.SpliceChunksRequest) error {
+		for _, chunkDigest := range req.GetChunkDigests() {
+			chunkRN := digest.NewCASResourceName(chunkDigest, instanceName, digestFunction)
+			if err := chunkRN.Validate(); err != nil {
+				return status.InvalidArgumentErrorf("invalid chunk resource name %v: %s", chunkRN, err)
+			}
+			// No valid chunking produces empty chunks. Rejecting them also
+			// bounds the total number of chunks a stream can send, since every
+			// accepted chunk must contribute at least one byte to totalSize.
+			if chunkDigest.GetSizeBytes() == 0 {
+				return status.InvalidArgumentErrorf("zero-size chunk %s is not allowed", chunkDigest.GetHash())
+			}
+			totalSize += chunkDigest.GetSizeBytes()
+			// Fail fast before reading and hashing chunks that can no longer
+			// produce the expected blob.
+			if totalSize > blobDigest.GetSizeBytes() {
+				return status.InvalidArgumentErrorf("spliced chunks size mismatch: got at least %d bytes, expected %d", totalSize, blobDigest.GetSizeBytes())
+			}
+			rc, err := s.cache.Reader(ctx, chunkRN.ToProto(), 0, 0)
+			if err != nil {
+				return status.WrapErrorf(err, "read chunk %s from CAS", chunkDigest.GetHash())
+			}
+			n, copyErr := io.Copy(hasher, rc)
+			closeErr := rc.Close()
+			if copyErr != nil {
+				return status.WrapErrorf(copyErr, "hash chunk %s", chunkDigest.GetHash())
+			}
+			if closeErr != nil {
+				return status.WrapErrorf(closeErr, "close chunk %s", chunkDigest.GetHash())
+			}
+			if n != chunkDigest.GetSizeBytes() {
+				return status.InvalidArgumentErrorf("read %d bytes for chunk %s, expected %d", n, chunkDigest.GetHash(), chunkDigest.GetSizeBytes())
+			}
+			chunkDigests = append(chunkDigests, chunkDigest)
+		}
+		return nil
+	}
+
+	for req := firstReq; ; {
+		if err := consumeChunks(req); err != nil {
+			return err
+		}
+		req, err = stream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+	}
+	if totalSize != blobDigest.GetSizeBytes() {
+		return status.InvalidArgumentErrorf("spliced chunks size mismatch: got %d bytes, expected %d", totalSize, blobDigest.GetSizeBytes())
+	}
+
+	if nDigests := len(chunkDigests); nDigests == 0 {
+		return status.InvalidArgumentError("chunk_digests cannot be empty")
+	} else if nDigests == 1 {
+		return status.UnimplementedError("SpliceChunks with only one chunk is not supported")
+	}
+	computedDigest := &repb.Digest{
+		Hash:      hex.EncodeToString(hasher.Sum(nil)),
+		SizeBytes: totalSize,
+	}
+	if !digest.Equal(computedDigest, blobDigest) {
+		return status.InvalidArgumentErrorf("computed digest %s does not match expected %s", digest.String(computedDigest), digest.String(blobDigest))
+	}
+	manifest := &chunking.Manifest{
+		BlobDigest:     blobDigest,
+		ChunkDigests:   chunkDigests,
+		InstanceName:   instanceName,
+		DigestFunction: digestFunction,
+	}
+	if err := manifest.StoreVerified(ctx, s.cache); err != nil {
+		return err
+	}
+	return stream.SendAndClose(&repb.SpliceBlobResponse{BlobDigest: blobDigest})
+}
+
 func (s *ContentAddressableStorageServer) readChunkedBlob(ctx context.Context, blobDigest *repb.Digest, instanceName string, digestFunction repb.DigestFunction_Value, readZstd bool) ([]byte, error) {
 	if blobDigest.GetSizeBytes() > rpcutil.GRPCMaxSizeBytes {
 		return nil, status.NotFoundErrorf("blob %s not found", blobDigest.GetHash())
@@ -1333,4 +1491,34 @@ func (s *ContentAddressableStorageServer) splitBlob(ctx context.Context, req *re
 		return nil, status.NotFoundErrorf("required chunks not found in CAS: %s", chunking.DigestsSummary(resp.GetMissingBlobDigests()))
 	}
 	return manifest.ToSplitBlobResponse(), nil
+}
+
+func (s *ContentAddressableStorageServer) SplitChunks(req *repb.SplitBlobRequest, stream repb.ContentAddressableStorage_SplitChunksServer) error {
+	ctx := stream.Context()
+	resp, err := s.splitBlob(ctx, req)
+	if err != nil {
+		log.CtxInfof(ctx, "SplitChunks failed: %v", err)
+		return err
+	}
+	return sendSplitChunksResponses(resp.GetChunkDigests(), resp.GetChunkingFunction(), splitChunksMaxDigestsPerResponse, stream.Send)
+}
+
+// sendSplitChunksResponses pages the ordered chunk digests into responses of at
+// most maxPerResponse digests. The chunking function is only set on the first
+// response, per the SplitChunks contract.
+func sendSplitChunksResponses(chunks []*repb.Digest, chunkingFunction repb.ChunkingFunction_Value, maxPerResponse int, send func(*repb.SplitChunksResponse) error) error {
+	maxPerResponse = max(maxPerResponse, 1)
+	for start := 0; ; start += maxPerResponse {
+		end := min(start+maxPerResponse, len(chunks))
+		resp := &repb.SplitChunksResponse{ChunkDigests: chunks[start:end]}
+		if start == 0 {
+			resp.ChunkingFunction = chunkingFunction
+		}
+		if err := send(resp); err != nil {
+			return err
+		}
+		if end == len(chunks) {
+			return nil
+		}
+	}
 }
