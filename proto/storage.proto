@@ -67,6 +67,25 @@ message StorageMetadata {
   // contents of the the specified location.
 }
 
+// FileMetadataView is a view of FileMetadata with only the fields used by
+// FindMissing calls.
+message FileMetadataView {
+  option (vtproto.mempool) = true;
+  StorageMetadataView storage_metadata = 2;
+  int64 stored_size_bytes = 3;
+  int64 last_access_usec = 4;
+  int64 last_modify_usec = 5;
+}
+
+// StorageMetadata is a view of StorageMetadata with only the fields used by
+// FindMissing calls.
+message StorageMetadataView {
+  message GCSMetadataView {
+    int64 last_custom_time_usec = 2;
+  }
+  GCSMetadataView gcs_metadata = 5;
+}
+
 message FileMetadata {
   option (vtproto.mempool) = true;
   FileRecord file_record = 1;

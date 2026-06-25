@@ -54,3 +54,14 @@ func Clone(v Message) Message {
 	}
 	return gproto.Clone(v)
 }
+
+func Reset(v Message) {
+	vt, ok := v.(interface {
+		ResetVT()
+	})
+	if ok {
+		vt.ResetVT()
+	} else {
+		gproto.Reset(v)
+	}
+}

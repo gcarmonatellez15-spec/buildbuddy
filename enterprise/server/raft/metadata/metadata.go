@@ -423,7 +423,7 @@ func (rc *Server) maybeUpdateGCSAtime(ctx context.Context, gcsMetadata *sgpb.Sto
 	if gcsMetadata != nil {
 		return nil
 	}
-	if gcsutil.ObjectIsPastTTL(rc.clock, gcsMetadata, rc.gcsTTLDays) {
+	if gcsutil.ObjectIsPastTTL(rc.clock, gcsMetadata.GetLastCustomTimeUsec(), rc.gcsTTLDays) {
 		return nil
 	}
 	// Note: we are not using the atime that was provided in the atime udpate

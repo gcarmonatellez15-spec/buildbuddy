@@ -4,8 +4,6 @@ import (
 	"time"
 
 	"github.com/jonboulle/clockwork"
-
-	sgpb "github.com/buildbuddy-io/buildbuddy/proto/storage"
 )
 
 // ObjectIsPastTTL checks whether a GCS object has passed its TTL.
@@ -18,8 +16,7 @@ import (
 //
 // For this reason, if a GCS object is ever less than 1 hour away from
 // TTL, assume it has already been marked for deletion.
-func ObjectIsPastTTL(clock clockwork.Clock, gcsMetadata *sgpb.StorageMetadata_GCSMetadata, gcsTTLDays int64) bool {
-	customTimeUsec := gcsMetadata.GetLastCustomTimeUsec()
+func ObjectIsPastTTL(clock clockwork.Clock, lastCustomTimeUsec int64, gcsTTLDays int64) bool {
 	buffer := time.Hour
-	return clock.Since(time.UnixMicro(customTimeUsec))+buffer > time.Duration(gcsTTLDays*24)*time.Hour
+	return clock.Since(time.UnixMicro(lastCustomTimeUsec))+buffer > time.Duration(gcsTTLDays*24)*time.Hour
 }

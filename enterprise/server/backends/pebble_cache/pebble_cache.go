@@ -955,7 +955,7 @@ func (p *PebbleCache) updateAtime(update *accessTimeUpdate) error {
 	// If this is a GCS object, update the custom time and record the new
 	// custom time.
 	if gcsMetadata := md.GetStorageMetadata().GetGcsMetadata(); gcsMetadata != nil {
-		if gcsutil.ObjectIsPastTTL(p.clock, gcsMetadata, p.gcsTTLDays) {
+		if gcsutil.ObjectIsPastTTL(p.clock, gcsMetadata.GetLastCustomTimeUsec(), p.gcsTTLDays) {
 			return nil
 		}
 		if err := p.fileStorer.UpdateBlobAtime(p.env.GetServerContext(), gcsMetadata, newAtime); err != nil {
@@ -1564,7 +1564,7 @@ func (p *PebbleCache) makeFileRecord(groupID string, encryption *sgpb.Encryption
 	}, nil
 }
 
-func (p *PebbleCache) lookupFileMetadataAndVersion(ctx context.Context, db pebble.IPebbleDB, key filestore.PebbleKey, fileMetadata *sgpb.FileMetadata) (filestore.PebbleKeyVersion, error) {
+func (p *PebbleCache) lookupFileMetadataAndVersion(ctx context.Context, db pebble.IPebbleDB, key filestore.PebbleKey, fileMetadata proto.Message) (filestore.PebbleKeyVersion, error) {
 	var lastErr error
 	for minVersion, version := p.minAndMaxDatabaseVersions(); version >= minVersion; version-- {
 		keyBytes, err := key.Bytes(version)
@@ -1575,12 +1575,12 @@ func (p *PebbleCache) lookupFileMetadataAndVersion(ctx context.Context, db pebbl
 		if lastErr == nil {
 			return version, nil
 		}
-		fileMetadata.ResetVT()
+		proto.Reset(fileMetadata)
 	}
 	return -1, lastErr
 }
 
-func (p *PebbleCache) lookupFileMetadata(ctx context.Context, db pebble.IPebbleDB, key filestore.PebbleKey, fileMetadata *sgpb.FileMetadata) error {
+func (p *PebbleCache) lookupFileMetadata(ctx context.Context, db pebble.IPebbleDB, key filestore.PebbleKey, fileMetadata proto.Message) error {
 	_, err := p.lookupFileMetadataAndVersion(ctx, db, key, fileMetadata)
 	return err
 }
@@ -1692,7 +1692,7 @@ func (p *PebbleCache) findMissing(ctx context.Context, db pebble.IPebbleDB, grou
 	unlockFn := p.locker.RLock(key.LockID())
 	defer unlockFn()
 
-	md := sgpb.FileMetadataFromVTPool()
+	md := sgpb.FileMetadataViewFromVTPool()
 	defer md.ReturnToVTPool()
 	err = p.lookupFileMetadata(ctx, db, key, md)
 	if err != nil {
@@ -1709,7 +1709,7 @@ func (p *PebbleCache) findMissing(ctx context.Context, db pebble.IPebbleDB, grou
 	// so that we avoid saying something exists when it's been deleted by
 	// a GCS lifecycle rule.
 	if gcsMetadata := md.GetStorageMetadata().GetGcsMetadata(); gcsMetadata != nil {
-		if gcsutil.ObjectIsPastTTL(p.clock, gcsMetadata, p.gcsTTLDays) {
+		if gcsutil.ObjectIsPastTTL(p.clock, gcsMetadata.GetLastCustomTimeUsec(), p.gcsTTLDays) {
 			return status.NotFoundError("backing object may have expired")
 		}
 	}
@@ -2993,7 +2993,7 @@ func (p *PebbleCache) reader(ctx context.Context, db pebble.IPebbleDB, groupID s
 	// so that we avoid saying something exists when it's been deleted by
 	// a GCS lifecycle rule.
 	if gcsMetadata := fileMetadata.GetStorageMetadata().GetGcsMetadata(); gcsMetadata != nil {
-		if gcsutil.ObjectIsPastTTL(p.clock, gcsMetadata, p.gcsTTLDays) {
+		if gcsutil.ObjectIsPastTTL(p.clock, gcsMetadata.GetLastCustomTimeUsec(), p.gcsTTLDays) {
 			return nil, status.NotFoundError("backing object may have expired")
 		}
 	}
