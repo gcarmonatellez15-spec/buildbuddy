@@ -12,7 +12,7 @@
 +def _stdlib_execution_requirements(go):
 +    # Non-pure stdlib actions run cgo and pass C toolchain paths through
 +    # CGO_CFLAGS/CGO_LDFLAGS. Bazel does not path-map environment values.
-+    return SUPPORTS_PATH_MAPPING_REQUIREMENT if go.mode.pure else {}
++    return {}
 +
  def _build_env(go):
      env = go.env
