@@ -377,6 +377,11 @@ const (
 
 	GRPCMethodLabel = "grpc_method"
 
+	// The direction of an HTTP/2 flow-control window relative to the local
+	// endpoint: `remote` (the window for data we send) or `local` (the window
+	// for data we receive).
+	GRPCFlowControlDirectionLabel = "direction"
+
 	// Destination cloud provider inferred from the remote IP range: `aws`,
 	// `gcp`, or `other`.
 	DestinationProviderLabel = "provider"
@@ -1249,6 +1254,14 @@ var (
 		Buckets:   durationUsecBuckets(1*time.Microsecond, 1*time.Second, 2),
 	}, []string{
 		StatusHumanReadableLabel,
+	})
+
+	RemoteExecutionBuildrootDiskUsageMeasurementDurationUsec = promauto.NewHistogram(prometheus.HistogramOpts{
+		Namespace: bbNamespace,
+		Subsystem: "remote_execution",
+		Name:      "buildroot_disk_usage_measurement_duration_usec",
+		Help:      "Duration of the buildroot (workspace) disk usage measurement performed after a task finishes, in **microseconds**.",
+		Buckets:   durationUsecBuckets(1*time.Microsecond, 1*time.Minute, 2),
 	})
 
 	RemoteExecutionResourceUsageTimelineMetadataSizeBytes = promauto.NewHistogramVec(prometheus.HistogramOpts{
@@ -2866,6 +2879,9 @@ var (
 		Help:      "Number of raft leases on each nodehost.",
 	}, []string{
 		RaftRangeIDLabel,
+		RaftNodeHostIDLabel,
+		PartitionID,
+		ZoneLabel,
 	})
 
 	RaftLeaders = promauto.NewGaugeVec(prometheus.GaugeOpts{
@@ -2875,6 +2891,9 @@ var (
 		Help:      "Number of raft leaders on each nodehost.",
 	}, []string{
 		RaftRangeIDLabel,
+		RaftNodeHostIDLabel,
+		PartitionID,
+		ZoneLabel,
 	})
 
 	RaftBytes = promauto.NewGaugeVec(prometheus.GaugeOpts{
@@ -2884,6 +2903,9 @@ var (
 		Help:      "Size (in bytes) of each range.",
 	}, []string{
 		RaftRangeIDLabel,
+		RaftNodeHostIDLabel,
+		PartitionID,
+		ZoneLabel,
 	})
 
 	RaftProposals = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -2893,6 +2915,21 @@ var (
 		Help:      "The total number of statemachine proposals on each range.",
 	}, []string{
 		RaftRangeIDLabel,
+		RaftNodeHostIDLabel,
+		PartitionID,
+		ZoneLabel,
+	})
+
+	RaftReads = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: bbNamespace,
+		Subsystem: "raft",
+		Name:      "reads",
+		Help:      "The total number of read requests served for each range.",
+	}, []string{
+		RaftRangeIDLabel,
+		RaftNodeHostIDLabel,
+		PartitionID,
+		ZoneLabel,
 	})
 
 	RaftSplits = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -4099,6 +4136,15 @@ var (
 		CompressionType,
 	})
 
+	FindMissingBlobsCacheLookups = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: bbNamespace,
+		Subsystem: "proxy",
+		Name:      "find_missing_blobs_cache_lookups",
+		Help:      "The number of digests looked up in the Cache Proxy's local FindMissingBlobs cache by cache hit/miss status.",
+	}, []string{
+		CacheHitMissStatus,
+	})
+
 	RemoteAtimeUpdates = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: bbNamespace,
 		Subsystem: "proxy",
@@ -4246,6 +4292,46 @@ var (
 		GRPCMethodLabel,
 		ConnectionIndexLabel,
 	})
+
+	GRPCClientConnectionCount = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: bbNamespace,
+		Subsystem: "grpc",
+		Name:      "client_connection_count",
+		Help:      "Number of client gRPC connections (channelz sockets) observed per target, sampled from channelz.",
+	}, []string{
+		GRPCTargetLabel,
+	})
+
+	GRPCClientFlowControlBlockedConnections = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: bbNamespace,
+		Subsystem: "grpc",
+		Name:      "client_flow_control_blocked_connections",
+		Help:      "Number of client gRPC connections whose remote HTTP/2 flow-control (send) window is 0, per target. A nonzero value means connections are send-blocked behind the peer's flow control, which head-of-line-blocks every stream on the connection.",
+	}, []string{
+		GRPCTargetLabel,
+	})
+
+	GRPCClientFlowControlWindowBytes = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: bbNamespace,
+		Subsystem: "grpc",
+		Name:      "client_flow_control_window_bytes",
+		Help:      "Distribution of HTTP/2 flow-control window sizes across client gRPC connections, sampled periodically from channelz. `direction=remote` is the window for data we send (0 means send-blocked); `direction=local` is the window for data we receive.",
+		Buckets:   []float64{0, 1, 1024, 16384, 65536, 262144, 1048576, 2097152, 4194304, 8388608, 16777216},
+	}, []string{
+		GRPCTargetLabel,
+		GRPCFlowControlDirectionLabel,
+	})
+
+	GRPCClientConnectionOpenStreams = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: bbNamespace,
+		Subsystem: "grpc",
+		Name:      "client_connection_open_streams",
+		Help:      "Distribution of open HTTP/2 streams across client gRPC connections, sampled periodically from channelz. Values near the peer's max-concurrent-streams limit (commonly 100) indicate connections at capacity.",
+		Buckets:   []float64{0, 1, 5, 10, 25, 50, 75, 90, 95, 100, 110, 150},
+	}, []string{
+		GRPCTargetLabel,
+	})
+
 	GRPCServerEgressBytes = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: bbNamespace,
 		Subsystem: "grpc",

@@ -2,24 +2,79 @@ package grpc_forward
 
 import (
 	"context"
+	"fmt"
+	"net"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
+	"github.com/buildbuddy-io/buildbuddy/server/real_environment"
 	"github.com/buildbuddy-io/buildbuddy/server/util/authutil"
 	"github.com/buildbuddy-io/buildbuddy/server/util/clientip"
 	"github.com/buildbuddy-io/buildbuddy/server/util/grpc_client"
+	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/protobuf/types/known/emptypb"
 )
 
 func cleanup() {
 	for _, pool := range backendConnectionPools {
 		pool.Close()
 	}
-	backendConnectionPools = nil
+	// Reset to an empty (non-nil) map so a subsequent test that dials through
+	// getConnectionPool doesn't panic assigning into a nil map.
+	backendConnectionPools = map[string]*grpc_client.ClientConnPool{}
+}
+
+// TestForwarding_PropagatesClientHeadersToBackend tests that the unknown-RPC
+// gRPC forwarder preserves client-supplied headers.
+func TestForwarding_PropagatesClientHeadersToBackend(t *testing.T) {
+	t.Cleanup(cleanup)
+	const clientHeader = "x-test-client-header"
+
+	backendLis, err := net.Listen("tcp", "localhost:0")
+	require.NoError(t, err)
+	var mu sync.Mutex
+	var gotMD metadata.MD
+	backendHandler := func(_ any, stream grpc.ServerStream) error {
+		md, _ := metadata.FromIncomingContext(stream.Context())
+		mu.Lock()
+		gotMD = md.Copy()
+		mu.Unlock()
+		_ = stream.RecvMsg(&emptypb.Empty{})
+		return stream.SendMsg(&emptypb.Empty{})
+	}
+	backend := grpc.NewServer(grpc.UnknownServiceHandler(backendHandler))
+	go func() { _ = backend.Serve(backendLis) }()
+	t.Cleanup(backend.Stop)
+	backendTarget := fmt.Sprintf("grpc://localhost:%d", backendLis.Addr().(*net.TCPAddr).Port)
+
+	flags.Set(t, "app.proxy_targets", []proxyPair{{Prefix: "", Target: backendTarget}})
+	fwdOpt := GetForwardingServerOption(real_environment.NewRealEnv(nil))
+	require.NotNil(t, fwdOpt, "forwarding must be enabled when app.proxy_targets is set")
+
+	proxyLis, err := net.Listen("tcp", "localhost:0")
+	require.NoError(t, err)
+	proxy := grpc.NewServer(fwdOpt)
+	go func() { _ = proxy.Serve(proxyLis) }()
+	t.Cleanup(proxy.Stop)
+	proxyTarget := fmt.Sprintf("grpc://localhost:%d", proxyLis.Addr().(*net.TCPAddr).Port)
+
+	clientConn, err := grpc_client.DialSimple(proxyTarget)
+	require.NoError(t, err)
+	t.Cleanup(func() { clientConn.Close() })
+
+	ctx := metadata.AppendToOutgoingContext(context.Background(), clientHeader, "test-value")
+	err = clientConn.Invoke(ctx, "/test.TestService/TestMethod", &emptypb.Empty{}, &emptypb.Empty{})
+	require.NoError(t, err)
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, []string{"test-value"}, gotMD.Get(clientHeader),
+		"the client-supplied header must be forwarded through the proxy to the backend")
 }
 
 func TestGetConnectionPool_DedupesConcurrentDialsForSameTarget(t *testing.T) {
@@ -118,7 +173,7 @@ func TestCtxWithClientIP(t *testing.T) {
 	t.Run("client-supplied client IP header is overwritten with the resolved IP", func(t *testing.T) {
 		cis := &fakeIdentityService{header: identity}
 		// Simulate an attacker pre-setting the client-IP header to a spoofed value.
-		ctx := metadata.AppendToOutgoingContext(ctxWithResolvedClientIP(clientIP), clientip.HeaderName, "9.9.9.9")
+		ctx := metadata.NewIncomingContext(ctxWithResolvedClientIP(clientIP), metadata.Pairs(clientip.HeaderName, "9.9.9.9"))
 		ctx, err := ctxWithClientIP(ctx, cis)
 		require.NoError(t, err)
 
@@ -132,7 +187,7 @@ func TestCtxWithClientIP(t *testing.T) {
 	t.Run("client-supplied client IP is stripped when no IP is resolved", func(t *testing.T) {
 		cis := &fakeIdentityService{header: identity}
 		// Spoofed header present, but the proxy resolved no client IP of its own.
-		ctx := metadata.AppendToOutgoingContext(context.Background(), clientip.HeaderName, "9.9.9.9")
+		ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs(clientip.HeaderName, "9.9.9.9"))
 		ctx, err := ctxWithClientIP(ctx, cis)
 		require.NoError(t, err)
 
@@ -150,5 +205,23 @@ func TestCtxWithClientIP(t *testing.T) {
 		require.True(t, ok)
 		require.Equal(t, []string{clientIP}, md.Get(clientip.HeaderName))
 		require.Empty(t, md.Get(authutil.ClientIdentityHeaderName))
+	})
+
+	t.Run("caller-supplied identity is preserved rather than overwritten", func(t *testing.T) {
+		cis := &fakeIdentityService{header: identity}
+		// A caller that already carries a signed identity (e.g. a workflow) must
+		// keep it so the backend still authorizes on it (e.g. IP-rule bypass);
+		// the proxy must not clobber it with its own grpc-proxy identity.
+		const callerIdentity = "workflow-identity"
+		ctx := metadata.NewIncomingContext(ctxWithResolvedClientIP(clientIP), metadata.Pairs(authutil.ClientIdentityHeaderName, callerIdentity))
+		ctx, err := ctxWithClientIP(ctx, cis)
+		require.NoError(t, err)
+
+		md, ok := metadata.FromOutgoingContext(ctx)
+		require.True(t, ok)
+		require.Equal(t, []string{clientIP}, md.Get(clientip.HeaderName))
+		require.Equal(t, []string{callerIdentity}, md.Get(authutil.ClientIdentityHeaderName))
+		// The proxy did not mint a grpc-proxy identity for this request.
+		require.Empty(t, cis.lastClient)
 	})
 }

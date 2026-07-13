@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/filestore"
@@ -19,7 +20,6 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/raft/keys"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/pebble"
 	"github.com/buildbuddy-io/buildbuddy/server/metrics"
-	"github.com/buildbuddy-io/buildbuddy/server/util/canary"
 	"github.com/buildbuddy-io/buildbuddy/server/util/lib/set"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
 	"github.com/buildbuddy-io/buildbuddy/server/util/proto"
@@ -60,6 +60,7 @@ type IStore interface {
 	SnapshotCluster(ctx context.Context, rangeID uint64) error
 	StartShard(ctx context.Context, req *rfpb.StartShardRequest) (*rfpb.StartShardResponse, error)
 	NHID() string
+	Zone() string
 }
 
 // Replica implements the interface IOnDiskStateMachine. More details of
@@ -91,6 +92,15 @@ type Replica struct {
 
 	readQPS        *qps.Counter
 	raftProposeQPS *qps.Counter
+
+	// readCount / proposeCount are the per-range read / propose counters
+	// (metrics.RaftReads / metrics.RaftProposals), resolved once per range
+	// descriptor in setRange so the hot request paths avoid building label
+	// maps on every op. atomic so the Lookup / Update goroutines can load
+	// them lock-free while setRange swaps them in. nil until the first
+	// setRange.
+	readCount    atomic.Pointer[prometheus.Counter]
+	proposeCount atomic.Pointer[prometheus.Counter]
 
 	// txid that locked the mapped range.
 	// We want to lock the mapped range when we are in the process of splitting.
@@ -260,6 +270,13 @@ func (sm *Replica) setRange(val []byte) error {
 		Start: rangeDescriptor.GetStart(),
 		End:   rangeDescriptor.GetEnd(),
 	}
+	// Resolve the counter handles once here so the hot request paths
+	// (handleRead / singleUpdate) avoid building label maps on every op.
+	labels := keys.RangeMetricLabels(rangeDescriptor, sm.NHID, sm.store.Zone())
+	readCount := metrics.RaftReads.With(labels)
+	proposeCount := metrics.RaftProposals.With(labels)
+	sm.readCount.Store(&readCount)
+	sm.proposeCount.Store(&proposeCount)
 	sm.store.UpdateRange(sm.rangeDescriptor, sm)
 	sm.rangeMu.Unlock()
 
@@ -268,9 +285,7 @@ func (sm *Replica) setRange(val []byte) error {
 		// channel (which can drop under load). The apply path will refresh
 		// it as data is written; this guarantees presence at replica open
 		// and on every range-descriptor mutation.
-		metrics.RaftBytes.With(prometheus.Labels{
-			metrics.RaftRangeIDLabel: strconv.FormatUint(rangeDescriptor.GetRangeId(), 10),
-		}).Set(float64(usage.GetEstimatedDiskBytesUsed()))
+		metrics.RaftBytes.With(keys.RangeMetricLabels(rangeDescriptor, sm.NHID, sm.store.Zone())).Set(float64(usage.GetEstimatedDiskBytesUsed()))
 		sm.notifyListenersOfUsage(rangeDescriptor, usage)
 	} else {
 		sm.log.Errorf("Error computing usage upon opening replica: %s", err)
@@ -1342,6 +1357,11 @@ func (sm *Replica) handlePropose(wb pebble.Batch, req *rfpb.RequestUnion) *rfpb.
 
 func (sm *Replica) handleRead(db ReplicaReader, req *rfpb.RequestUnion) *rfpb.ResponseUnion {
 	sm.readQPS.Inc()
+	// readCount is swapped by setRange on the Update goroutine; load it
+	// lock-free here on the concurrent Lookup goroutine.
+	if c := sm.readCount.Load(); c != nil { // nil until the first setRange.
+		(*c).Inc()
+	}
 	rsp := &rfpb.ResponseUnion{}
 
 	switch value := req.Value.(type) {
@@ -1549,10 +1569,9 @@ func (sm *Replica) singleUpdate(db pebble.IPebbleDB, entry dbsm.Entry) (dbsm.Ent
 	sm.rangeMu.RUnlock()
 
 	// Increment QPS counters.
-	rangeID := rd.GetRangeId()
-	metrics.RaftProposals.With(prometheus.Labels{
-		metrics.RaftRangeIDLabel: strconv.Itoa(int(rangeID)),
-	}).Inc()
+	if c := sm.proposeCount.Load(); c != nil { // nil until the first setRange.
+		(*c).Inc()
+	}
 	sm.raftProposeQPS.Inc()
 
 	batchRsp := &rfpb.BatchCmdResponse{}
@@ -1719,7 +1738,6 @@ func (sm *Replica) Update(entries []dbsm.Entry) ([]dbsm.Entry, error) {
 // The Lookup method is a read only method, it should never change the state
 // of IOnDiskStateMachine.
 func (sm *Replica) Lookup(key interface{}) (interface{}, error) {
-	defer canary.Start("replica.Lookup", time.Second)()
 	reqBuf, ok := key.([]byte)
 	if !ok {
 		return nil, status.FailedPreconditionError("Cannot convert key to []byte")
@@ -2120,9 +2138,10 @@ func (sm *Replica) Close() error {
 		sm.store.RemoveRange(rangeDescriptor, sm)
 	}
 	if rangeDescriptor != nil {
-		metrics.RaftBytes.Delete(prometheus.Labels{
-			metrics.RaftRangeIDLabel: strconv.FormatUint(rangeDescriptor.GetRangeId(), 10),
-		})
+		labels := keys.RangeMetricLabels(rangeDescriptor, sm.NHID, sm.store.Zone())
+		metrics.RaftBytes.Delete(labels)
+		metrics.RaftReads.Delete(labels)
+		metrics.RaftProposals.Delete(labels)
 	}
 
 	sm.readQPS.Stop()

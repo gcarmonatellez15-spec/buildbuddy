@@ -25,11 +25,14 @@ go_test(
     embed = [":grpc_forward"],
     deps = [
         "//server/interfaces",
+        "//server/real_environment",
         "//server/util/authutil",
         "//server/util/clientip",
         "//server/util/grpc_client",
+        "//server/util/testing/flags",
         "@com_github_stretchr_testify//require",
         "@org_golang_google_grpc//:grpc",
         "@org_golang_google_grpc//metadata",
+        "@org_golang_google_protobuf//types/known/emptypb",
     ],
 )

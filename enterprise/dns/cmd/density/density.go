@@ -6,11 +6,13 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/enterprise/dns/server"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/backends/configsecrets"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/experiments"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/experiments/gcsflagsync"
+	"github.com/buildbuddy-io/buildbuddy/server/backends/blobstore/gcs"
 	"github.com/buildbuddy-io/buildbuddy/server/config"
 	"github.com/buildbuddy-io/buildbuddy/server/real_environment"
 	"github.com/buildbuddy-io/buildbuddy/server/util/flag"
@@ -30,9 +32,19 @@ var (
 	serverType     = flag.String("server_type", "dns-server", "The server type to match on health checks")
 	monitoringAddr = flag.String("monitoring.listen", ":9090", "Address to listen for monitoring traffic on")
 
-	dnsPort    = flag.Int("dns.port", 53, "The port to listen for DNS traffic on")
-	zoneFile   = flag.String("dns.zone_file", "", "Path to a zone file containing the DNS records to serve")
-	zoneOrigin = flag.String("dns.zone_origin", "", "Origin domain to qualify relative names in the zone file against. If empty, names must be fully qualified.")
+	dnsPort   = flag.Int("dns.port", 53, "The port to listen for DNS traffic on")
+	zoneFiles = flag.Slice[string]("dns.zone_file", []string{}, "Path to a zone file to serve. Repeat the flag to serve records from multiple zones (each file's SOA anchors negative answers for names under its apex).")
+
+	// Self-hosted ACME DNS-01: when dns.acme.gcs.bucket is set, density accepts
+	// RFC2136 UPDATEs for _acme-challenge TXT records (authenticated by the TSIG
+	// key) and serves them from the GCS bucket, shared across replicas.
+	acmeGCSBucket   = flag.String("dns.acme.gcs.bucket", "", "GCS bucket for self-hosted ACME _acme-challenge TXT records. Setting this enables RFC2136 UPDATE handling.")
+	acmeGCSCredFile = flag.String("dns.acme.gcs.credentials_file", "", "Path to a JSON credentials file for the ACME GCS bucket.")
+	acmeGCSCreds    = flag.String("dns.acme.gcs.credentials", "", "JSON credentials for the ACME GCS bucket.", flag.Secret)
+	acmeGCSProject  = flag.String("dns.acme.gcs.project_id", "", "GCP project ID owning the ACME GCS bucket.")
+	acmeCacheTTL    = flag.Duration("dns.acme.cache_ttl", 10*time.Second, "How long to cache ACME _acme-challenge TXT lookups before re-reading from GCS.")
+	acmeTSIGName    = flag.String("dns.acme.tsig_key_name", "", "TSIG key name authorizing RFC2136 UPDATEs of _acme-challenge records.")
+	acmeTSIGSecret  = flag.String("dns.acme.tsig_secret", "", "Base64 TSIG secret for dns.acme.tsig_key_name.", flag.Secret)
 )
 
 func main() {
@@ -106,15 +118,60 @@ func main() {
 	env.GetHealthChecker().WaitForGracefulShutdown()
 }
 
+// hasSOA reports whether rrs contains an SOA record, which a valid zone file
+// must define at its apex.
+func hasSOA(rrs []dns.RR) bool {
+	for _, rr := range rrs {
+		if rr.Header().Rrtype == dns.TypeSOA {
+			return true
+		}
+	}
+	return false
+}
+
 func startDNSServer(env *real_environment.RealEnv) error {
-	if *zoneFile == "" {
-		return status.FailedPreconditionError("a --dns.zone_file must be configured")
+	if len(*zoneFiles) == 0 {
+		return status.FailedPreconditionError("at least one --dns.zone_file must be configured")
 	}
-	records, err := server.ParseZoneFile(*zoneFile, *zoneOrigin)
-	if err != nil {
-		return status.WrapErrorf(err, "parse zone file %q", *zoneFile)
+	var records []dns.RR
+	for _, zoneFile := range *zoneFiles {
+		rrs, err := server.ParseZoneFile(zoneFile)
+		if err != nil {
+			return status.WrapErrorf(err, "parse zone file %q", zoneFile)
+		}
+		// Every zone file must define an SOA at its apex. Without one, the zone
+		// contributes no apex, so its names route to no zone and are answered
+		// REFUSED even though their records loaded -- a silent, confusing
+		// failure. Refuse to start instead.
+		if !hasSOA(rrs) {
+			return status.FailedPreconditionErrorf("zone file %q has no SOA record; every zone file must define an SOA at its apex", zoneFile)
+		}
+		records = append(records, rrs...)
 	}
-	handler := server.NewHandler(records, env)
+
+	// Self-hosted ACME (RFC2136 UPDATE + blobstore-backed challenge store) is
+	// enabled by configuring an ACME GCS bucket; the TSIG key authorizes updates.
+	var acme *server.Challenges
+	tsigSecrets := map[string]string{}
+	if *acmeGCSBucket != "" {
+		// Without a TSIG key, every RFC2136 UPDATE fails authentication and
+		// cert-manager's challenge writes are silently rejected, so refuse to
+		// start half-enabled rather than hang issuance with no diagnostic.
+		if *acmeTSIGName == "" {
+			return status.FailedPreconditionError("dns.acme.gcs.bucket is set but dns.acme.tsig_key_name is empty; RFC2136 UPDATEs could not be authenticated")
+		}
+		bs, err := gcs.NewGCSBlobStore(context.Background(), *acmeGCSBucket, *acmeGCSCredFile, *acmeGCSCreds, *acmeGCSProject, false /*=enableCompression*/)
+		if err != nil {
+			return status.WrapError(err, "init ACME challenge blobstore")
+		}
+		acme, err = server.NewChallenges(bs, *acmeCacheTTL)
+		if err != nil {
+			return status.WrapError(err, "init ACME challenge store")
+		}
+		tsigSecrets[dns.Fqdn(*acmeTSIGName)] = *acmeTSIGSecret
+	}
+
+	handler := server.NewHandler(env, records, acme)
 
 	addr := fmt.Sprintf("%s:%d", *listen, *dnsPort)
 
@@ -130,8 +187,8 @@ func startDNSServer(env *real_environment.RealEnv) error {
 		packetConn.Close()
 		return status.WrapErrorf(err, "bind DNS tcp %s", addr)
 	}
-	udpServer := &dns.Server{PacketConn: packetConn, Handler: handler}
-	tcpServer := &dns.Server{Listener: listener, Handler: handler}
+	udpServer := &dns.Server{PacketConn: packetConn, Handler: handler, TsigSecret: tsigSecrets, MsgAcceptFunc: server.MsgAccept}
+	tcpServer := &dns.Server{Listener: listener, Handler: handler, TsigSecret: tsigSecrets, MsgAcceptFunc: server.MsgAccept}
 
 	for _, s := range []*dns.Server{udpServer, tcpServer} {
 		go func() {

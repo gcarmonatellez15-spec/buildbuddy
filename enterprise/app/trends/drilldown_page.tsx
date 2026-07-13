@@ -172,6 +172,12 @@ const METRIC_OPTIONS: MetricOption[] = [
     }),
   },
   {
+    name: "Action cache hits",
+    metric: stat_filter.Metric.create({
+      invocation: stat_filter.InvocationMetricType.ACTION_CACHE_HITS_INVOCATION_METRIC,
+    }),
+  },
+  {
     name: "Cached CPU time",
     metric: stat_filter.Metric.create({
       invocation: stat_filter.InvocationMetricType.TIME_SAVED_USEC_INVOCATION_METRIC,
@@ -659,11 +665,26 @@ export default class DrilldownPageComponent extends React.Component<Props, State
       case stats.DrilldownType.EXIT_CODE_DRILLDOWN_TYPE:
         this.navigateDimensionBarClick(encodeExitCodeUrlParam(originalLabel));
         return;
+      case stats.DrilldownType.OS_DRILLDOWN_TYPE:
+        this.navigateGenericFilterBarClick(`os:"${originalLabel}"`);
+        return;
+      case stats.DrilldownType.ARCH_DRILLDOWN_TYPE:
+        this.navigateGenericFilterBarClick(`arch:"${originalLabel}"`);
+        return;
       case stats.DrilldownType.GROUP_ID_DRILLDOWN_TYPE:
       case stats.DrilldownType.DATE_DRILLDOWN_TYPE:
       default:
         return;
     }
+  }
+
+  navigateGenericFilterBarClick(newParam: string) {
+    let result = this.props.search.get("sq") ?? "";
+    if (result) {
+      result += " ";
+    }
+    result += newParam;
+    this.navigateForBarClick("sq", result);
   }
 
   navigateDimensionBarClick(newParam: string) {
@@ -703,6 +724,10 @@ export default class DrilldownPageComponent extends React.Component<Props, State
         return "pool (execution)";
       case stats.DrilldownType.EXIT_CODE_DRILLDOWN_TYPE:
         return "exit code (execution)";
+      case stats.DrilldownType.ARCH_DRILLDOWN_TYPE:
+        return "arch (execution)";
+      case stats.DrilldownType.OS_DRILLDOWN_TYPE:
+        return "os (execution)";
       default:
         return "???";
     }
@@ -816,7 +841,7 @@ export default class DrilldownPageComponent extends React.Component<Props, State
 
     return (
       <div className="drilldown-page-zoom-summary zoomed">
-        <ZoomIn className="icon"></ZoomIn>
+        <ZoomIn></ZoomIn>
         {this.currentZoomFilters && (
           <div className="drilldown-page-zoom-filters">
             <div className="drilldown-page-zoom-filter-attr">
@@ -831,7 +856,7 @@ export default class DrilldownPageComponent extends React.Component<Props, State
           className="square drilldown-page-zoom-button"
           title={"Clear zoom"}
           onClick={() => this.handleClearZoom()}>
-          <X className="icon white" />
+          <X className="white" />
         </FilledButton>
       </div>
     );

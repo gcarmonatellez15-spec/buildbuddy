@@ -2348,12 +2348,12 @@ func BenchmarkGetMulti(b *testing.B) {
 	}
 }
 
-func benchmarkFindMissing(b *testing.B, pc *pebble_cache.PebbleCache, ctx context.Context, digestSizeBytes int64, insert bool) {
+func benchmarkFindMissing(b *testing.B, pc *pebble_cache.PebbleCache, ctx context.Context, digestSizeBytes int64, present bool) {
 	digestKeys := make([]*rspb.ResourceName, 0, 100)
 	for i := 0; i < 100; i++ {
 		r, buf := testdigest.RandomCASResourceBuf(b, digestSizeBytes)
 		digestKeys = append(digestKeys, r)
-		if insert {
+		if present {
 			if err := pc.Set(ctx, r, buf); err != nil {
 				b.Fatalf("Error setting %q in cache: %s", r.GetDigest().GetHash(), err.Error())
 			}
@@ -2381,7 +2381,7 @@ func benchmarkFindMissing(b *testing.B, pc *pebble_cache.PebbleCache, ctx contex
 			b.Fatal(err)
 		}
 		b.StopTimer()
-		if insert {
+		if present {
 			if len(missing) != 0 {
 				b.Fatalf("Missing: %+v, but all digests should be present", missing)
 			}
@@ -2401,25 +2401,38 @@ func BenchmarkFindMissing(b *testing.B) {
 	te.SetAuthenticator(testauth.NewTestAuthenticator(b, emptyUserMap))
 	ctx := getAnonContext(b, te)
 
-	maxSizeBytes := int64(100_000_000)
-	rootDir := testfs.MakeTempDir(b)
-	pc, err := pebble_cache.NewPebbleCache(te, &pebble_cache.Options{RootDirectory: rootDir, MaxSizeBytes: maxSizeBytes})
-	if err != nil {
-		b.Fatal(err)
-	}
-	pc.Start()
-	defer pc.Stop()
+	// Make sure there's no eviction to avoid muddying up the benchmark.
+	maxSizeBytes := int64(1_000_000_000_000)
 
-	sizes := []int64{1024, 1024 * 1024, 10 * 1024 * 1024}
-	for _, insert := range []bool{false, true} {
-		for _, size := range sizes {
-			name := fmt.Sprintf("size=%s/insert=%v", units.BytesSize(float64(size)), insert)
-			b.Run(name, func(b *testing.B) {
-				benchmarkFindMissing(b, pc, ctx, size, insert)
+	for _, storage := range []struct {
+		name                   string
+		digestSizeBytes        int64
+		maxInlineFileSizeBytes int64
+	}{
+		{"512B-inline", 512, 1024},
+		{"32KiB-inline", 32 * 1024, 64 * 1024},
+		{"1KiB-external", 1024, 1024},
+	} {
+		for _, present := range []bool{true, false} {
+			rootDir := testfs.MakeTempDir(b)
+			pc, err := pebble_cache.NewPebbleCache(te, &pebble_cache.Options{
+				RootDirectory:          rootDir,
+				MaxSizeBytes:           maxSizeBytes,
+				MaxInlineFileSizeBytes: storage.maxInlineFileSizeBytes,
 			})
+			if err != nil {
+				b.Fatal(err)
+			}
+			pc.Start()
+			name := fmt.Sprintf("storage=%s/present=%v", storage.name, present)
+			b.Run(name, func(b *testing.B) {
+				benchmarkFindMissing(b, pc, ctx, storage.digestSizeBytes, present)
+			})
+			if err := pc.Stop(); err != nil {
+				b.Fatal(err)
+			}
 		}
 	}
-
 }
 
 func benchmarkContains1(b *testing.B, pc *pebble_cache.PebbleCache, ctx context.Context, digestSizeBytes int64) {
@@ -2790,6 +2803,72 @@ func TestGCSBlobStorageOverwriteObjects(t *testing.T) {
 		_, err := pc.Get(ctx, rn)
 		assert.NoError(t, err, rn)
 	}
+}
+
+func TestGCSAtimeUpdateThreshold(t *testing.T) {
+	te := testenv.GetTestEnv(t)
+	te.SetAuthenticator(testauth.NewTestAuthenticator(t, emptyUserMap))
+	// sendAtimeUpdate gates on wall-clock time (time.Since), so start the fake
+	// clock well in the past. Otherwise, once an atime update moves the stored
+	// atime to a fake-future timestamp, subsequent accesses would be skipped.
+	clock := clockwork.NewFakeClockAt(time.Now().Add(-30 * 24 * time.Hour))
+	ctx := getAnonContext(t, te)
+
+	var minGCSFileSize int64 = 1
+	var gcsTTLDays int64 = 1
+	atimeThreshold := 10 * time.Hour
+
+	mockGCS := mockgcs.New(clock)
+	require.NoError(t, mockGCS.SetBucketCustomTimeTTL(ctx, gcsTTLDays))
+	fileStorer := filestore.New(filestore.WithGCSBlobstore(mockGCS, "app-name"), filestore.WithClock(clock))
+	options := &pebble_cache.Options{
+		RootDirectory:           testfs.MakeTempDir(t),
+		MaxSizeBytes:            int64(1_000_000), // 1MB
+		Clock:                   clock,
+		FileStorer:              fileStorer,
+		MaxInlineFileSizeBytes:  1,
+		MinGCSFileSizeBytes:     &minGCSFileSize,
+		GCSTTLDays:              &gcsTTLDays,
+		GCSAtimeUpdateThreshold: &atimeThreshold,
+		AtimeUpdateThreshold:    pointer(time.Duration(0)), // update atime on every access
+		AtimeBufferSize:         pointer(0),                // blocking channel of atime updates
+	}
+	pc, err := pebble_cache.NewPebbleCache(te, options)
+	require.NoError(t, err)
+	require.NoError(t, pc.Start())
+	defer pc.Stop()
+
+	rn, buf := testdigest.RandomCASResourceBuf(t, 100)
+	require.NoError(t, pc.Set(ctx, rn, buf))
+
+	// Writing the object sets its custom time; it does not call UpdateCustomTime.
+	require.Equal(t, 0, mockGCS.UpdateCustomTimeCallCount())
+
+	// waitForAtime blocks until the object's pebble atime reaches the current
+	// (fake) clock time, i.e. until the queued atime update has been processed.
+	waitForAtime := func() {
+		want := clock.Now().UnixMicro()
+		require.Eventually(t, func() bool {
+			md, err := pc.Metadata(ctx, rn)
+			return err == nil && md.LastAccessTimeUsec == want
+		}, time.Minute, 10*time.Millisecond)
+	}
+
+	// Access the object before the threshold elapses. The pebble atime is
+	// updated, but the GCS custom time is left alone.
+	clock.Advance(1 * time.Hour)
+	_, err = pc.Get(ctx, rn)
+	require.NoError(t, err)
+	waitForAtime()
+	require.Equal(t, 0, mockGCS.UpdateCustomTimeCallCount())
+
+	// Access the object once its custom time is older than the threshold.
+	// Now the GCS custom time is refreshed.
+	clock.Advance(10 * time.Hour)
+	_, err = pc.Get(ctx, rn)
+	require.NoError(t, err)
+	waitForAtime()
+	require.Equal(t, 1, mockGCS.UpdateCustomTimeCallCount())
 }
 
 func pointer[T any](value T) *T {

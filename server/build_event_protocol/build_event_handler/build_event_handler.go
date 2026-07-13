@@ -507,6 +507,11 @@ func (r *statsRecorder) handleTask(ctx context.Context, task *recordStatsTask) {
 
 	artifactsUploaded := make(map[string]struct{}, 0)
 	for _, uri := range task.persist.URIs {
+		// Only persist artifacts from caches that are hosted on the BuildBuddy
+		// domain (but only if we know it).
+		if cache_api_url.String() != "" && urlutil.GetDomain(uri.Hostname()) != urlutil.GetDomain(cache_api_url.WithPath("").Hostname()) {
+			continue
+		}
 		rn, err := digest.ParseDownloadResourceName(uri.Path)
 		if err != nil {
 			log.CtxErrorf(ctx, "Unparseable artifact URI: %s", err)
@@ -525,12 +530,8 @@ func (r *statsRecorder) handleTask(ctx context.Context, task *recordStatsTask) {
 			ctx := usageutil.WithLocalServerLabels(ctx)
 
 			fullPath := path.Join(task.invocationInfo.id, cacheArtifactsBlobstorePath, uri.Path)
-			// Only persist artifacts from caches that are hosted on the BuildBuddy
-			// domain (but only if we know it).
-			if cache_api_url.String() == "" || urlutil.GetDomain(uri.Hostname()) == urlutil.GetDomain(cache_api_url.WithPath("").Hostname()) {
-				if err := persistArtifact(ctx, r.env, uri, fullPath); err != nil {
-					log.CtxError(ctx, err.Error())
-				}
+			if err := persistArtifact(ctx, r.env, uri, fullPath); err != nil {
+				log.CtxError(ctx, err.Error())
 			}
 			return nil
 		})
@@ -842,6 +843,10 @@ type EventChannel struct {
 	// when we're retrying an invocation that is already complete, or is
 	// incomplete but was created too far in the past.
 	isVoid bool
+
+	// lastDBUpdateTime is when the invocation row was last written to the DB.
+	// It is used to periodically update the row while events are streaming.
+	lastDBUpdateTime time.Time
 }
 
 func (e *EventChannel) Context() context.Context {
@@ -866,15 +871,35 @@ func (e *EventChannel) FinalizeInvocation(iid string) error {
 	invocation.Attempt = e.attempt
 	invocation.HasChunkedEventLogs = e.logWriter != nil
 
+	disconnected := invocation.GetInvocationStatus() == inspb.InvocationStatus_DISCONNECTED_INVOCATION_STATUS
+
+	// Flush/close blobstore writers (raw event protos and build logs).
 	if e.pw != nil {
 		if err := e.pw.Flush(ctx); err != nil {
-			return err
+			// Return the error so that the client can retry sending events,
+			// giving us another chance to write them to blobstore. If the
+			// client disconnected, just log the error since they won't get the
+			// error that we return here. This also ensures that we properly
+			// mark the invocation disconnected below.
+			if disconnected {
+				log.CtxWarningf(ctx, "Failed to flush invocation events to blobstore: %s", err)
+			} else {
+				return err
+			}
 		}
 	}
-
 	if e.logWriter != nil {
 		if err := e.logWriter.Close(ctx); err != nil {
-			return err
+			// Return the error so that the client can retry sending events,
+			// giving us another chance to write them to blobstore. If the
+			// client disconnected, just log the error since they won't get the
+			// error that we return here. This also ensures that we properly
+			// mark the invocation disconnected in the DB below.
+			if disconnected {
+				log.CtxWarningf(ctx, "Failed to flush invocation logs to blobstore: %s", err)
+			} else {
+				return err
+			}
 		}
 		invocation.LastChunkId = e.logWriter.GetLastChunkId(ctx)
 	}
@@ -899,7 +924,7 @@ func (e *EventChannel) FinalizeInvocation(iid string) error {
 	// Report a disconnect only if we successfully updated the invocation.
 	// This reduces the likelihood that the disconnected invocation's status
 	// will overwrite any statuses written by a more recent attempt.
-	if invocation.GetInvocationStatus() == inspb.InvocationStatus_DISCONNECTED_INVOCATION_STATUS {
+	if disconnected {
 		log.CtxWarning(ctx, "Reporting disconnected status for invocation")
 		e.statusReporter.ReportDisconnect(ctx)
 	}
@@ -1087,10 +1112,11 @@ func (e *EventChannel) handleEvent(event *pepb.PublishBuildToolEventStreamReques
 		}
 		if !created {
 			// We failed to retry an existing invocation
-			log.CtxWarningf(e.ctx, "Voiding EventChannel for invocation %s: invocation already exists and is either completed or was last updated over 4 hours ago, so may not be retried.", iid)
+			log.CtxWarningf(e.ctx, "Voiding EventChannel for invocation %s: invocation already exists and is either completed or past its reconnect window, so may not be retried.", iid)
 			e.isVoid = true
 			return nil
 		}
+		e.lastDBUpdateTime = e.env.GetClock().Now()
 		e.attempt = ti.Attempt
 		e.ctx = log.EnrichContext(e.ctx, "invocation_attempt", fmt.Sprintf("%d", e.attempt))
 		log.CtxInfof(e.ctx, "Created invocation %q, attempt %d", ti.InvocationID, ti.Attempt)
@@ -1282,6 +1308,25 @@ func (e *EventChannel) processSingleEvent(event *inpb.InvocationEvent, iid strin
 		e.wroteBuildMetadata = true
 	}
 
+	// While events are still streaming, periodically update the invocation
+	// row. The row is otherwise only updated at creation, when metadata is
+	// loaded, and at finalization, so an invocation that runs longer than the
+	// reconnect window would look abandoned and could never be retried if it
+	// got disconnected.
+	updatePeriod := e.env.GetInvocationDB().GetInvocationReconnectWindow() / 2
+	if e.env.GetClock().Since(e.lastDBUpdateTime) >= updatePeriod {
+		ti := &tables.Invocation{InvocationID: iid, Attempt: e.attempt}
+		if updated, err := e.env.GetInvocationDB().UpdateInvocation(e.ctx, ti); err != nil {
+			log.CtxErrorf(e.ctx, "Error updating invocation row while streaming events: %s", err)
+			return status.UnavailableErrorf("write periodic metadata update: %s", err)
+		} else if !updated {
+			e.isVoid = true
+			return status.CanceledErrorf("Attempt %d of invocation %s pre-empted by more recent attempt.", e.attempt, iid)
+		} else {
+			e.lastDBUpdateTime = e.env.GetClock().Now()
+		}
+	}
+
 	return nil
 }
 
@@ -1382,6 +1427,7 @@ func (e *EventChannel) writeBuildMetadata(ctx context.Context, invocationID stri
 		e.isVoid = true
 		return status.CanceledErrorf("Attempt %d of invocation %s pre-empted by more recent attempt, no build metadata written.", e.attempt, invocationID)
 	}
+	e.lastDBUpdateTime = e.env.GetClock().Now()
 	return nil
 }
 

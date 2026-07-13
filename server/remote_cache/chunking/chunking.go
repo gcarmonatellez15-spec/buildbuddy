@@ -94,12 +94,30 @@ func MaxSupportedChunkSizeBytes() int64 {
 	return 4 * 1024 * 1024
 }
 
+// MaxCompressedChunkReadSizeBytes is the per-chunk compressed read buffer cap.
+func MaxCompressedChunkReadSizeBytes() int64 {
+	return 4 * MaxSupportedChunkSizeBytes()
+}
+
 // MinChunkedReadFallbackSizeBytes can be configured independently from the
 // write threshold so server-side miss fallback paths can still read older
 // chunked blobs that were written with a smaller chunk size, but is clamped to
 // at most MaxChunkSizeBytes().
 func MinChunkedReadFallbackSizeBytes(ctx context.Context, efp interfaces.ExperimentFlagProvider) int64 {
 	return min(*minChunkedReadFallbackSizeBytes, MaxChunkSizeBytes(ctx, efp))
+}
+
+// ShouldDiscardLegacyChunkedBlob reports whether a missing whole CAS blob should
+// skip manifest fallback while migrating to a larger avg chunk-size override.
+func ShouldDiscardLegacyChunkedBlob(ctx context.Context, efp interfaces.ExperimentFlagProvider, digestSizeBytes int64) bool {
+	if efp == nil {
+		return false
+	}
+	if AvgChunkSizeBytes(ctx, efp) <= *avgChunkSizeBytes {
+		return false
+	}
+	return digestSizeBytes > MinChunkedReadFallbackSizeBytes(ctx, efp) &&
+		digestSizeBytes <= MaxChunkSizeBytes(ctx, efp)
 }
 
 func MaxWriteSizeBytes(ctx context.Context, efp interfaces.ExperimentFlagProvider) int64 {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/uuid"
+	"github.com/jonboulle/clockwork"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/encoding/prototext"
@@ -980,6 +982,100 @@ func TestUnfinishedFinalizeWithCanceledContext(t *testing.T) {
 	assert.Equal(t, inspb.InvocationStatus_DISCONNECTED_INVOCATION_STATUS, invocation.InvocationStatus)
 }
 
+// failingBlobstore wraps a Blobstore and fails all blob writes when
+// failWrites is set.
+type failingBlobstore struct {
+	interfaces.Blobstore
+	failWrites atomic.Bool
+}
+
+func (b *failingBlobstore) WriteBlob(ctx context.Context, blobName string, data []byte) (int, error) {
+	if b.failWrites.Load() {
+		return 0, fmt.Errorf("blobstore write failed")
+	}
+	return b.Blobstore.WriteBlob(ctx, blobName, data)
+}
+
+func TestUnfinishedFinalizeWithBlobstoreWriteFailure(t *testing.T) {
+	te := testenv.GetTestEnv(t)
+	auth := testauth.NewTestAuthenticator(t, testauth.TestUsers("USER1", "GROUP1"))
+	te.SetAuthenticator(auth)
+	bs := &failingBlobstore{Blobstore: te.GetBlobstore()}
+	te.SetBlobstore(bs)
+	ctx := t.Context()
+	testUUID, err := uuid.NewRandom()
+	require.NoError(t, err)
+	testInvocationID := testUUID.String()
+
+	handler := build_event_handler.NewBuildEventHandler(te)
+	channel, err := handler.OpenChannel(ctx, testInvocationID)
+	require.NoError(t, err)
+	defer channel.Close()
+
+	// Send started event with api key. The event is buffered in the
+	// invocation event stream and not yet flushed to blobstore.
+	request := streamRequest(startedEvent("--remote_header='"+authutil.APIKeyHeader+"=USER1'", &bspb.BuildEventId_WorkspaceStatus{}), testInvocationID, 1)
+	err = channel.HandleEvent(request)
+	assert.NoError(t, err)
+
+	// Make blobstore writes fail, then finalize the invocation without a
+	// finished event, as happens when the client disconnects. Flushing the
+	// buffered events fails, but there is no connected client left to receive
+	// an error and retry, so finalization should proceed anyway.
+	bs.failWrites.Store(true)
+	err = channel.FinalizeInvocation(testInvocationID)
+	require.NoError(t, err)
+
+	// Make sure the invocation was marked disconnected in the DB so that
+	// bazel may retry it.
+	authCtx := auth.AuthContextFromAPIKey(t.Context(), "USER1")
+	ti, err := te.GetInvocationDB().LookupInvocation(authCtx, testInvocationID)
+	require.NoError(t, err)
+	assert.Equal(t, int64(inspb.InvocationStatus_DISCONNECTED_INVOCATION_STATUS), ti.InvocationStatus)
+}
+
+func TestFinishedFinalizeWithBlobstoreWriteFailure(t *testing.T) {
+	te := testenv.GetTestEnv(t)
+	auth := testauth.NewTestAuthenticator(t, testauth.TestUsers("USER1", "GROUP1"))
+	te.SetAuthenticator(auth)
+	bs := &failingBlobstore{Blobstore: te.GetBlobstore()}
+	te.SetBlobstore(bs)
+	ctx := t.Context()
+	testUUID, err := uuid.NewRandom()
+	require.NoError(t, err)
+	testInvocationID := testUUID.String()
+
+	handler := build_event_handler.NewBuildEventHandler(te)
+	channel, err := handler.OpenChannel(ctx, testInvocationID)
+	require.NoError(t, err)
+	defer channel.Close()
+
+	// Send started event with api key. The event is buffered in the
+	// invocation event stream and not yet flushed to blobstore.
+	request := streamRequest(startedEvent("--remote_header='"+authutil.APIKeyHeader+"=USER1'", &bspb.BuildEventId_WorkspaceStatus{}), testInvocationID, 1)
+	err = channel.HandleEvent(request)
+	assert.NoError(t, err)
+
+	// Send finished event, so that the invocation finalizes as complete
+	// rather than disconnected.
+	request = streamRequest(finishedEvent(), testInvocationID, 2)
+	err = channel.HandleEvent(request)
+	assert.NoError(t, err)
+
+	// Make blobstore writes fail, then finalize the invocation. The client is
+	// still connected, so the error from flushing the buffered events should
+	// be returned, which lets the client retry sending the events.
+	bs.failWrites.Store(true)
+	err = channel.FinalizeInvocation(testInvocationID)
+	require.Error(t, err)
+
+	// Make sure the invocation was not finalized in the DB.
+	authCtx := auth.AuthContextFromAPIKey(t.Context(), "USER1")
+	ti, err := te.GetInvocationDB().LookupInvocation(authCtx, testInvocationID)
+	require.NoError(t, err)
+	assert.Equal(t, int64(inspb.InvocationStatus_PARTIAL_INVOCATION_STATUS), ti.InvocationStatus)
+}
+
 func TestUnfinishedFinalize(t *testing.T) {
 	te := testenv.GetTestEnv(t)
 	auth := testauth.NewTestAuthenticator(t, testauth.TestUsers("USER1", "GROUP1"))
@@ -1021,6 +1117,62 @@ func TestUnfinishedFinalize(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, "abc123", invocation.CommitSha)
 	assert.Equal(t, inspb.InvocationStatus_DISCONNECTED_INVOCATION_STATUS, invocation.InvocationStatus)
+}
+
+func TestPeriodicInvocationRowUpdateWhileStreaming(t *testing.T) {
+	te := testenv.GetTestEnv(t)
+	auth := testauth.NewTestAuthenticator(t, testauth.TestUsers("USER1", "GROUP1"))
+	te.SetAuthenticator(auth)
+	clock := clockwork.NewFakeClock()
+	te.SetClock(clock)
+	ctx := context.Background()
+	testUUID, err := uuid.NewRandom()
+	require.NoError(t, err)
+	testInvocationID := testUUID.String()
+
+	// Make DB writes stamp a fixed time so that we can tell when the
+	// invocation row gets written.
+	t0 := time.Unix(1000, 0)
+	te.GetInvocationDB().SetNowFunc(func() time.Time { return t0 })
+
+	handler := build_event_handler.NewBuildEventHandler(te)
+	channel, err := handler.OpenChannel(ctx, testInvocationID)
+	require.NoError(t, err)
+	defer channel.Close()
+
+	// Send started event with api key, which creates the invocation row.
+	request := streamRequest(startedEvent("--remote_header='"+authutil.APIKeyHeader+"=USER1'", &bspb.BuildEventId_WorkspaceStatus{}), testInvocationID, 1)
+	err = channel.HandleEvent(request)
+	require.NoError(t, err)
+
+	authCtx := auth.AuthContextFromAPIKey(context.Background(), "USER1")
+	ti, err := te.GetInvocationDB().LookupInvocation(authCtx, testInvocationID)
+	require.NoError(t, err)
+	require.Equal(t, t0.UnixMicro(), ti.UpdatedAtUsec)
+
+	// Advance the DB clock. An event that arrives before the periodic update
+	// period has elapsed should not update the invocation row.
+	t1 := time.Unix(2000, 0)
+	te.GetInvocationDB().SetNowFunc(func() time.Time { return t1 })
+	request = streamRequest(progressEventWithOutput("hello", ""), testInvocationID, 2)
+	err = channel.HandleEvent(request)
+	require.NoError(t, err)
+
+	ti, err = te.GetInvocationDB().LookupInvocation(authCtx, testInvocationID)
+	require.NoError(t, err)
+	assert.Equal(t, t0.UnixMicro(), ti.UpdatedAtUsec)
+
+	// Advance the stream's clock past half the reconnect window. The next
+	// event should update the invocation row, keeping the invocation
+	// retryable in case it gets disconnected later.
+	clock.Advance(te.GetInvocationDB().GetInvocationReconnectWindow()/2 + time.Second)
+	request = streamRequest(progressEventWithOutput("world", ""), testInvocationID, 3)
+	err = channel.HandleEvent(request)
+	require.NoError(t, err)
+
+	ti, err = te.GetInvocationDB().LookupInvocation(authCtx, testInvocationID)
+	require.NoError(t, err)
+	assert.Equal(t, t1.UnixMicro(), ti.UpdatedAtUsec)
 }
 
 func TestRetryOnComplete(t *testing.T) {

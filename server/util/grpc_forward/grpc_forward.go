@@ -81,20 +81,28 @@ func getConnectionPool(dialer dialFn, target string) (*grpc_client.ClientConnPoo
 	return newPool, nil
 }
 
-// ctxWithClientIP overwrites the outgoing client-IP header with the IP this
-// proxy resolved (clientip.Get) and attaches a grpc-proxy identity that attests
-// to it. Any client-supplied client-IP header is stripped first: the proxy is
-// the sole authority for this value, so a caller can't smuggle an allowed IP
-// past the backend's IP-rule checks. The caller's other headers are forwarded by
-// the server's metadata-propagation interceptor (see GetForwardingServerOption).
+// ctxWithClientIP forwards the incoming request metadata to the backend,
+// overwriting the client-IP header with the IP this proxy resolved
+// (clientip.Get). When the caller has no client identity of its own, it also
+// attaches a grpc-proxy identity that attests to that IP; a caller that already
+// carries a signed identity (e.g. a workflow) keeps it so the backend still
+// authorizes on it. Any client-supplied client-IP header is stripped first: the
+// proxy is the sole authority for this value, so a caller can't smuggle an
+// allowed IP past the backend's IP-rule checks. All of the caller's other
+// headers are propagated verbatim.
 //
 // This composes across proxy hops without trusting raw headers: each hop's
 // clientIP interceptor only honors an incoming client-IP header when it carries
 // a verified grpc-proxy identity, so clientip.Get already reflects an upstream
 // proxy's attested IP, and we re-attest it here.
 func ctxWithClientIP(ctx context.Context, cis interfaces.ClientIdentityService) (context.Context, error) {
-	md, ok := metadata.FromOutgoingContext(ctx)
-	if !ok {
+	// Propagate the caller's incoming metadata to the backend. This is a
+	// blanket copy so that arbitrary headers survive the proxy hop; we then
+	// overwrite only the client-IP and client-identity headers below.
+	md, ok := metadata.FromIncomingContext(ctx)
+	if ok {
+		md = md.Copy()
+	} else {
 		md = metadata.MD{}
 	}
 
@@ -107,10 +115,16 @@ func ctxWithClientIP(ctx context.Context, cis interfaces.ClientIdentityService) 
 	}
 	md.Set(clientip.HeaderName, clientIP)
 
-	// Attach the grpc-proxy identity that attests to the client IP. The signed
-	// header is cached and refreshed by the client identity service. Set (not
-	// append) so a duplicate identity header can't be produced.
-	if cis != nil {
+	// Only attest as grpc-proxy when the caller has no identity of its own.
+	// Internal callers (workflows, executors, the app) forward their own signed
+	// identity, which the backend authorizes on -- e.g. workflows bypass IP
+	// rules by identity. Overwriting it with grpc-proxy would strip that bypass
+	// and get the request checked against the forwarded client IP instead.
+	// External callers have no identity, so we attach the grpc-proxy identity
+	// (cached and refreshed by the client identity service) that attests to the
+	// client IP. Set (not append) so a duplicate identity header can't be
+	// produced.
+	if cis != nil && len(md.Get(authutil.ClientIdentityHeaderName)) == 0 {
 		header, err := cis.CachedIdentityHeader(&interfaces.ClientIdentity{
 			Origin: interfaces.ClientIdentityInternalOrigin,
 			Client: interfaces.ClientIdentityGRPCProxy,

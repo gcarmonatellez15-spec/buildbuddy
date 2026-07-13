@@ -38,6 +38,7 @@ enum TabId {
   OrgSecrets = "org/secrets",
   OrgCacheEncryption = "org/cache-encryption",
   OrgIpRules = "org/ip-rules",
+  OrgSSO = "org/sso",
 
   PersonalPreferences = "personal/preferences",
   PersonalApiKeys = "personal/api-keys",
@@ -146,7 +147,7 @@ export default class SettingsComponent extends React.Component<SettingsProps> {
                       {/* If the user has a group-level GitHub link and the new GitHub App is
                         enabled, show a deprecation alert. */}
                       {capabilities.config.githubAppEnabled && this.props.user.selectedGroup.githubLinked && (
-                        <AlertCircle className="icon orange" />
+                        <AlertCircle className="orange" />
                       )}
                     </SettingsTab>
                   )}
@@ -167,6 +168,11 @@ export default class SettingsComponent extends React.Component<SettingsProps> {
                 {capabilities.config.ipRulesEnabled && router.canAccessIpRulesPage(this.props.user) && (
                   <SettingsTab id={TabId.OrgIpRules} activeTabId={activeTabId}>
                     IP rules
+                  </SettingsTab>
+                )}
+                {router.canAccessOrgSSOPage(this.props.user) && (
+                  <SettingsTab id={TabId.OrgSSO} activeTabId={activeTabId}>
+                    Single sign-on
                   </SettingsTab>
                 )}
               </div>
@@ -209,7 +215,7 @@ export default class SettingsComponent extends React.Component<SettingsProps> {
                         Choose between light and dark mode for the BuildBuddy UI.
                       </div>
                       <div className="settings-option-warning">
-                        <AlertCircle className="icon" />
+                        <AlertCircle />
                         <span>
                           Dark mode is experimental.{" "}
                           <a
@@ -278,7 +284,6 @@ export default class SettingsComponent extends React.Component<SettingsProps> {
                       {this.props.user.isImpersonating && (
                         <div className="settings-internal-section">
                           <GroupStatusComponent user={this.props.user} />
-                          <SSOConfigComponent user={this.props.user} />
                         </div>
                       )}
                     </>
@@ -394,6 +399,7 @@ export default class SettingsComponent extends React.Component<SettingsProps> {
                       <IpRulesComponent user={this.props.user} />
                     </>
                   )}
+                  {activeTabId === TabId.OrgSSO && <SSOConfigComponent user={this.props.user} />}
                 </>
               )}
             </div>

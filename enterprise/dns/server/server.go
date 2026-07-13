@@ -6,6 +6,8 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/experiments"
@@ -31,24 +33,59 @@ const (
 	// asnRoutingTTL is the TTL applied to experiment-routed A answers. It is
 	// short so routing decisions can change quickly.
 	asnRoutingTTL = 60
+
+	// acmeChallengePrefix matches the leftmost label of an ACME DNS-01
+	// validation name, which is always _acme-challenge.<domain being validated>.
+	acmeChallengePrefix = "_acme-challenge."
+
+	// acmeTTL is the TTL on served _acme-challenge TXT records. Short, since
+	// challenges are transient.
+	acmeTTL = 60
+
+	// acmeBlobstoreTimeout bounds the blobstore reads/writes made on the DNS
+	// request path so a slow or hung backend can't block handler goroutines
+	// indefinitely.
+	acmeBlobstoreTimeout = 10 * time.Second
 )
 
 type handler struct {
 	records map[string][]dns.RR
 
-	// soa is the zone's SOA record. We attach it to "no such answer" responses
-	// (the name doesn't exist, or has no record of the requested type); it
-	// tells the asking resolver how long it may remember that negative result
-	// instead of re-asking us every time. Nil if the zone file has no SOA.
-	soa dns.RR
+	// zones are the authoritative zones we serve (one per SOA record), sorted
+	// most-specific first so the first apex that encloses a queried name is the
+	// closest one. Each carries the SOA we attach to negative answers for names
+	// under it, and its apex lets us recognize which names we're authoritative
+	// for. Empty when no zone file supplied an SOA, in which case zone
+	// membership is not enforced (see zoneFor).
+	zones []zone
 
-	// apex is the canonical zone apex (the SOA owner). NS records here describe
-	// this zone; NS records below it are delegations (zone cuts). Empty if the
-	// zone file has no SOA, in which case we can't tell the two apart and treat
-	// nothing as a delegation.
-	apex string
+	// acme, when non-nil, makes this server self-host ACME DNS-01 validation:
+	// it accepts RFC2136 UPDATEs for in-zone _acme-challenge.* TXT records and
+	// answers queries for them from the blobstore-backed store.
+	acme *Challenges
 
 	env environment.Env
+}
+
+// zone is a single authoritative zone: its apex (the canonical SOA owner) and
+// the SOA record itself. The SOA is attached to negative answers for names in
+// the zone so resolvers can negatively cache them under the right authority.
+type zone struct {
+	apex string
+	soa  dns.RR
+}
+
+// zoneFor returns the zone most specifically enclosing name (the longest apex
+// that is a suffix of name), or nil if name falls under none of our zones. It
+// also returns nil when we serve no zones at all (no SOA was loaded); callers
+// treat that as "membership not enforced" and fall back to plain record lookup.
+func (h *handler) zoneFor(name string) *zone {
+	for i := range h.zones {
+		if dns.IsSubDomain(h.zones[i].apex, name) {
+			return &h.zones[i]
+		}
+	}
+	return nil
 }
 
 func (h *handler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
@@ -58,7 +95,9 @@ func (h *handler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 	m.Authoritative = true
 
 	recordType := "NO_QUESTION"
-	if len(r.Question) >= 1 {
+	if r.Opcode == dns.OpcodeUpdate {
+		recordType = "UPDATE"
+	} else if len(r.Question) >= 1 {
 		recordType = recordTypeLabel(r.Question[0].Qtype)
 	}
 	defer func() {
@@ -69,7 +108,22 @@ func (h *handler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 		metrics.DNSServerHandlerDurationUsec.With(prometheus.Labels{
 			metrics.DNSRecordTypeLabel: recordType,
 		}).Observe(float64(time.Since(start).Microseconds()))
+		qName := "."
+		if len(r.Question) >= 1 {
+			qName = r.Question[0].Name
+		}
+		log.Debugf("dns: client=%s type=%s name=%q rcode=%s answers=%d dur=%s",
+			w.RemoteAddr(), recordType, qName, rcodeLabel(m.Rcode), len(m.Answer), time.Since(start))
 	}()
+
+	// RFC2136 dynamic UPDATE (used by cert-manager to set/remove the ACME
+	// _acme-challenge TXT records we self-host) is handled separately.
+	// serveUpdate replies on its own message, so surface its rcode on m for the
+	// metric + log above.
+	if r.Opcode == dns.OpcodeUpdate {
+		m.Rcode = h.serveUpdate(w, r)
+		return
+	}
 
 	if len(r.Question) != 1 {
 		m.Rcode = dns.RcodeFormatError
@@ -82,24 +136,42 @@ func (h *handler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 	qName := dns.CanonicalName(r.Question[0].Name)
 	qType := r.Question[0].Qtype
 
-	// If the name lies at or below a zone cut (an in-zone NS record below the
-	// apex), we are not authoritative for it: return a referral to the child's
-	// nameservers instead of answering from this zone. This is how we hand a
-	// subdomain off to another DNS provider -- e.g. delegating an ACME
-	// _acme-challenge validation name back to a cloud DNS zone.
-	//
-	// TODO(tylerw): A DS query AT a zone cut is the exception: the DS RRset is
-	// parent-owned authoritative data and must be answered here (or NODATA+SOA),
-	// not referred down to the child (RFC 4035 sec. 3.1.4.1). DS queries strictly
-	// below the cut still refer, so the guard is "for DS, evaluate the delegation
-	// from qName's parent label", not a blanket skip. Inert until we serve
-	// DNSSEC (no DS/RRSIG today), and a full fix also needs signed DS/RRSIG/NSEC.
-	if ns := h.delegation(qName); len(ns) > 0 {
+	// Route the name to its enclosing zone once, up front: it selects the SOA
+	// for any negative answer below, and decides authority. If we serve zones
+	// but this name is under none of them, we are not authoritative for it, so
+	// answer REFUSED rather than an NXDOMAIN we have no zone SOA to anchor. When
+	// no zones are configured, zoneFor is nil for everything and this gate is
+	// skipped -- resolution proceeds over the records as an SOA-less set.
+	z := h.zoneFor(qName)
+	if len(h.zones) > 0 && z == nil {
+		m.Rcode = dns.RcodeRefused
 		m.Authoritative = false
-		m.Ns = append(m.Ns, ns...)
-		m.Extra = append(m.Extra, h.glue(ns)...)
 		if err := w.WriteMsg(m); err != nil {
-			log.Warningf("Failed to write DNS referral for %q: %s", qName, err)
+			log.Warningf("Failed to write REFUSED DNS response for %q: %s", qName, err)
+		}
+		return
+	}
+
+	// Self-hosted ACME: answer in-zone _acme-challenge.* names from the
+	// blobstore-backed store (records are set/removed via RFC2136 UPDATE). A name
+	// with a current value is answered; one without is authoritative NODATA.
+	if h.acme != nil && h.isACMEChallengeName(qName) {
+		if qType == dns.TypeTXT {
+			ctx, cancel := context.WithTimeout(context.Background(), acmeBlobstoreTimeout)
+			defer cancel()
+			if vals := h.acme.TXT(ctx, qName); len(vals) > 0 {
+				m.Answer = txtRecords(qName, vals)
+				if err := w.WriteMsg(m); err != nil {
+					log.Warningf("Failed to write ACME challenge answer for %q: %s", qName, err)
+				}
+				return
+			}
+		}
+		if z != nil && z.soa != nil {
+			m.Ns = append(m.Ns, z.soa)
+		}
+		if err := w.WriteMsg(m); err != nil {
+			log.Warningf("Failed to write ACME challenge NODATA for %q: %s", qName, err)
 		}
 		return
 	}
@@ -122,10 +194,10 @@ func (h *handler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 	}
 
 	// On a negative answer (NXDOMAIN, or NODATA: name exists but has no record
-	// of the requested type), include the zone SOA in the authority section so
-	// resolvers can negatively cache it.
-	if negative && h.soa != nil {
-		m.Ns = append(m.Ns, h.soa)
+	// of the requested type), include the enclosing zone's SOA in the authority
+	// section so resolvers can negatively cache it.
+	if negative && z != nil && z.soa != nil {
+		m.Ns = append(m.Ns, z.soa)
 	}
 
 	if err := w.WriteMsg(m); err != nil {
@@ -203,8 +275,10 @@ type asnRoutingConfig struct {
 // the override A records, or nil when the experiment yields no addresses (the
 // caller then keeps the static zone answer).
 func asnRoutedAnswer(efp interfaces.ExperimentFlagProvider, w dns.ResponseWriter, r *dns.Msg, qName string) []dns.RR {
-	asn := clientASN(w, r)
+	ip := clientIP(w, r)
+	asn := clientASN(ip)
 	obj := efp.Object(context.Background(), asnRoutingExperiment, nil,
+		experiments.WithContext("ip", ip.String()),
 		experiments.WithContext("asn", int64(asn)),
 		experiments.WithContext("name", qName))
 	if len(obj) == 0 {
@@ -293,47 +367,125 @@ func (h *handler) lookup(name string) ([]dns.RR, bool) {
 	return nil, false
 }
 
-// delegation returns the NS records at the closest zone cut enclosing name, or
-// nil if name is not under a delegation. A zone cut is any owner below the apex
-// that carries NS records; the apex's own NS records describe this zone, not a
-// delegation, so they are never treated as one. Walking up from name, the first
-// such owner is the cut, since a correct parent holds no data below it.
-func (h *handler) delegation(name string) []dns.RR {
-	if h.apex == "" {
-		return nil
-	}
-	for n := name; n != h.apex; {
-		if ns := filterByType(h.records[n], dns.TypeNS); len(ns) > 0 {
-			return ns
-		}
-		off, end := dns.NextLabel(n, 0)
-		if end {
-			break
-		}
-		n = n[off:]
-	}
-	return nil
+// isACMEChallengeName reports whether name is an in-zone ACME DNS-01 validation
+// name (leftmost label _acme-challenge, under one of our zone apexes). name is
+// canonicalized (lowercase, fqdn) by ServeDNS and acmeChallengePrefix is
+// lowercase, so the prefix check identifies the leftmost label without
+// allocating.
+func (h *handler) isACMEChallengeName(name string) bool {
+	return strings.HasPrefix(name, acmeChallengePrefix) && h.zoneFor(name) != nil
 }
 
-// glue returns the in-zone (in-bailiwick) address records for the targets of
-// the given NS records, for the additional section of a referral. Out-of-zone
-// targets -- the usual case for our delegations -- contribute no glue and are
-// resolved by the asking resolver itself.
-func (h *handler) glue(nsRecords []dns.RR) []dns.RR {
-	var out []dns.RR
-	for _, rr := range nsRecords {
-		ns, ok := rr.(*dns.NS)
-		if !ok {
-			continue
-		}
-		for _, a := range h.records[dns.CanonicalName(ns.Ns)] {
-			switch a.Header().Rrtype {
-			case dns.TypeA, dns.TypeAAAA:
-				out = append(out, a)
-			}
-		}
+// txtRecords builds a TXT RRset owned by name from the given string values.
+func txtRecords(name string, vals []string) []dns.RR {
+	out := make([]dns.RR, 0, len(vals))
+	for _, v := range vals {
+		out = append(out, &dns.TXT{
+			Hdr: dns.RR_Header{Name: name, Rrtype: dns.TypeTXT, Class: dns.ClassINET, Ttl: acmeTTL},
+			Txt: []string{v},
+		})
 	}
 	return out
+}
+
+// serveUpdate handles RFC2136 dynamic UPDATE messages, used by cert-manager's
+// rfc2136 solver to set and remove the _acme-challenge TXT records we self-host.
+// It requires a valid TSIG signature and only ever touches in-zone
+// _acme-challenge TXT names, so the TSIG key can't be used to rewrite the zone.
+func (h *handler) serveUpdate(w dns.ResponseWriter, r *dns.Msg) int {
+	m := new(dns.Msg)
+	m.SetReply(r)
+
+	reqTSIG := r.IsTsig()
+	// TsigStatus() is nil for an unsigned message too, so also require that the
+	// request actually carried a TSIG.
+	if h.acme == nil || reqTSIG == nil || w.TsigStatus() != nil {
+		m.SetRcode(r, dns.RcodeNotAuth)
+		writeUpdateReply(w, m, nil)
+		return dns.RcodeNotAuth
+	}
+
+	// RFC2136 updates are all-or-nothing, so validate every record before
+	// applying any: a record we'd refuse (wrong type/name, or an unsupported
+	// class) must reject the whole update, not leave an earlier record applied.
+	// The RRset-delete form (class ANY) arrives as a *dns.ANY with Rrtype TXT, so
+	// dispatch on the header rather than the concrete type.
+	for _, rr := range r.Ns { // RFC2136: the records to apply live in the Ns section.
+		hdr := rr.Header()
+		if hdr.Rrtype != dns.TypeTXT || !h.isACMEChallengeName(dns.CanonicalName(hdr.Name)) {
+			m.SetRcode(r, dns.RcodeRefused)
+			writeUpdateReply(w, m, reqTSIG)
+			return dns.RcodeRefused
+		}
+		switch hdr.Class {
+		case dns.ClassINET, dns.ClassNONE, dns.ClassANY:
+		default:
+			m.SetRcode(r, dns.RcodeRefused)
+			writeUpdateReply(w, m, reqTSIG)
+			return dns.RcodeRefused
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), acmeBlobstoreTimeout)
+	defer cancel()
+	rcode := dns.RcodeSuccess
+	for _, rr := range r.Ns {
+		hdr := rr.Header()
+		name := dns.CanonicalName(hdr.Name)
+		var err error
+		switch hdr.Class {
+		case dns.ClassINET: // add to the RRset
+			if txt, ok := rr.(*dns.TXT); ok {
+				err = h.acme.Add(ctx, name, txt.Txt...)
+			}
+		case dns.ClassNONE: // delete these values from the RRset
+			if txt, ok := rr.(*dns.TXT); ok {
+				err = h.acme.Delete(ctx, name, txt.Txt...)
+			}
+		case dns.ClassANY: // delete the whole RRset
+			err = h.acme.Delete(ctx, name)
+		}
+		if err != nil {
+			log.Warningf("ACME update for %q failed: %s", name, err)
+			rcode = dns.RcodeServerFailure
+			break
+		}
+	}
+	m.SetRcode(r, rcode)
+	writeUpdateReply(w, m, reqTSIG)
+	return rcode
+}
+
+// writeUpdateReply writes m, TSIG-signing it (with the request's key and
+// algorithm) when the request was signed so the rfc2136 client accepts it.
+func writeUpdateReply(w dns.ResponseWriter, m *dns.Msg, reqTSIG *dns.TSIG) {
+	if reqTSIG != nil {
+		m.SetTsig(reqTSIG.Hdr.Name, reqTSIG.Algorithm, 300, time.Now().Unix())
+	}
+	if err := w.WriteMsg(m); err != nil {
+		log.Warningf("Failed to write DNS UPDATE reply: %s", err)
+	}
+}
+
+// MsgAccept is the dns.Server message-accept policy for density. It mirrors
+// miekg's default policy (accept QUERY and NOTIFY, ignore responses, reject the
+// rest as NOTIMP) but additionally accepts dynamic UPDATE messages (opcode 5),
+// which we use for self-hosted ACME DNS-01.
+//
+// This is required: miekg's default MsgAcceptFunc rejects UPDATE with NOTIMP
+// *before* the handler runs, so without it the RFC2136 update path is
+// unreachable and the server answers every UPDATE with NOTIMP.
+func MsgAccept(dh dns.Header) dns.MsgAcceptAction {
+	// QR bit (0x8000) set => this is a response; servers don't act on responses.
+	if dh.Bits&(1<<15) != 0 {
+		return dns.MsgIgnore
+	}
+	switch int(dh.Bits>>11) & 0xF { // opcode occupies bits 11-14
+	case dns.OpcodeQuery, dns.OpcodeNotify, dns.OpcodeUpdate:
+		return dns.MsgAccept
+	default:
+		return dns.MsgRejectNotImplemented
+	}
 }
 
 // recordTypeLabel maps a query type to a metric label, collapsing unknown
@@ -366,8 +518,7 @@ func filterByType(records []dns.RR, qType uint16) []dns.RR {
 // clientASN returns the autonomous system number of the client the query is on
 // behalf of, for use as an experiment attribute. It returns 0 when the client
 // network is unknown or absent from the ASN database (e.g. private IPs).
-func clientASN(w dns.ResponseWriter, r *dns.Msg) uint32 {
-	ip := clientIP(w, r)
+func clientASN(ip netip.Addr) uint32 {
 	if !ip.IsValid() {
 		return 0
 	}
@@ -422,41 +573,53 @@ func addrFromNetAddr(a net.Addr) netip.Addr {
 	return netip.Addr{}
 }
 
-func NewHandler(resources []dns.RR, env environment.Env) dns.Handler {
+// NewHandler builds a DNS handler serving resources. acme, if non-nil,
+// self-hosts ACME DNS-01: the handler accepts RFC2136 UPDATEs for
+// _acme-challenge TXT records and answers queries for them from it.
+func NewHandler(env environment.Env, resources []dns.RR, acme *Challenges) dns.Handler {
 	records := make(map[string][]dns.RR, len(resources))
-	var soa dns.RR
+	var zones []zone
 	for _, rr := range resources {
 		name := dns.CanonicalName(rr.Header().Name)
 		records[name] = append(records[name], rr)
-		if rr.Header().Rrtype == dns.TypeSOA && soa == nil {
-			soa = rr
+		// Each zone file contributes one SOA at its apex; several files (several
+		// zones) contribute several. Later routing picks the closest enclosing
+		// one per query.
+		if rr.Header().Rrtype == dns.TypeSOA {
+			zones = append(zones, zone{apex: name, soa: rr})
 		}
 	}
-	apex := ""
-	if soa != nil {
-		apex = dns.CanonicalName(soa.Header().Name)
-	}
+	// Sort most-specific first (descending apex label count) so zoneFor's first
+	// suffix match is the closest enclosing zone -- e.g. a query under a child
+	// zone sub.example.com. is anchored on its SOA, not the parent example.com.
+	sort.SliceStable(zones, func(i, j int) bool {
+		return dns.CountLabel(zones[i].apex) > dns.CountLabel(zones[j].apex)
+	})
 	return &handler{
 		records: records,
-		soa:     soa,
-		apex:    apex,
+		zones:   zones,
+		acme:    acme,
 		env:     env,
 	}
 }
 
 // ParseZoneFile reads the resource records from a zone file.
 //
-// origin is the domain that relative owner names (including "@" and records
-// under a "$ORIGIN"-less file) are qualified against. If origin is empty, owner
-// names must be fully qualified or an error is returned.
-func ParseZoneFile(fileName, origin string) ([]dns.RR, error) {
+// Owner names must be fully qualified (or qualified by a "$ORIGIN" directive in
+// the file itself); a relative name with no origin to qualify it against is a
+// parse error. This matches the zone files we serve, which are exported from
+// Cloud DNS with fully-qualified names.
+func ParseZoneFile(fileName string) ([]dns.RR, error) {
 	file, err := os.Open(fileName)
 	if err != nil {
 		return nil, err
 	}
 	defer file.Close()
 
-	parser := dns.NewZoneParser(file, origin, filepath.Base(fileName))
+	// The empty origin means relative names can only be qualified by an in-file
+	// "$ORIGIN" directive; otherwise they error rather than being silently
+	// mis-qualified.
+	parser := dns.NewZoneParser(file, "", filepath.Base(fileName))
 	records := make([]dns.RR, 0)
 	for rr, ok := parser.Next(); ok; rr, ok = parser.Next() {
 		records = append(records, rr)
