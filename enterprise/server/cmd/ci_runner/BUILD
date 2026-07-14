@@ -16,6 +16,7 @@ go_library(
     deps = [
         "//enterprise/server/bes_artifacts",
         "//enterprise/server/util/ci_runner_env",
+        "//enterprise/server/util/git_trace2",
         "//enterprise/server/workflow/config",
         "//proto:build_event_stream_go_proto",
         "//proto:command_line_go_proto",
@@ -61,6 +62,16 @@ go_binary(
     static = "on",
 )
 
+go_test(
+    name = "ci_runner_test",
+    srcs = ["main_test.go"],
+    embed = [":ci_runner_lib"],
+    deps = [
+        "//enterprise/server/util/git_trace2",
+        "@com_github_stretchr_testify//require",
+    ],
+)
+
 container_image(
     name = "base_image",
     base = "@ci_runner_image//image:dockerfile_image.tar",
@@ -73,11 +84,4 @@ go_image(
     base = ":base_image",
     binary = ":ci_runner",
     tags = ["manual"],
-)
-
-go_test(
-    name = "ci_runner_test",
-    srcs = ["main_test.go"],
-    embed = [":ci_runner_lib"],
-    deps = ["@com_github_stretchr_testify//assert"],
 )
