@@ -104,6 +104,22 @@ build:ci --build_metadata=ROLE=CI
 
 This role will automatically be populated if the environment variable `CI` is set, which it is in most CI systems like Github Actions, CircleCI, Travis, Gitlab CI, BuildKite, Bitrise, and others.
 
+## GitHub checks
+
+By default, BuildBuddy names the GitHub commit status for a CI invocation after the Bazel command and target pattern, such as `bazel test //...`. Set `GITHUB_CHECKS_LABEL` to use a name that reflects the logical CI step instead:
+
+```bash
+bazel test //... --build_metadata=GITHUB_CHECKS_LABEL="Unit tests"
+```
+
+This is useful when a GitHub Actions job runs multiple Bazel invocations. The label only changes the name of the GitHub status; its details link still points to the BuildBuddy invocation.
+
+To prevent BuildBuddy from publishing a GitHub status for a particular invocation, set `DISABLE_COMMIT_STATUS_REPORTING`:
+
+```bash
+bazel test //... --build_metadata=DISABLE_COMMIT_STATUS_REPORTING=true
+```
+
 ## Test groups
 
 If using Github commit status reporting, you can use the test groups metadata field to specify how tests are grouped in your Github commit statuses. Test groups are specified as a comma separated list of test path prefixes that should be grouped together.

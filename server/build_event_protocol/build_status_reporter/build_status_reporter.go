@@ -285,6 +285,9 @@ func (r *BuildStatusReporter) invocationLabel() string {
 	if r.buildEventAccumulator.ActionName() != "" {
 		return r.buildEventAccumulator.ActionName()
 	}
+	if r.buildEventAccumulator.GitHubChecksLabel() != "" {
+		return r.buildEventAccumulator.GitHubChecksLabel()
+	}
 
 	command := r.buildEventAccumulator.Invocation().GetCommand()
 	pattern := r.buildEventAccumulator.Pattern()
